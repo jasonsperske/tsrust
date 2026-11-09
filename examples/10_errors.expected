@@ -1,0 +1,9 @@
+"42" -> ok 42
+"  7 " -> ok 7
+"" -> error Empty
+"abc" -> error NotANumber("abc")
+"-3" -> error Negative(-3)
+Ok(6)
+Err(NotANumber("oops"))
+Some(8) None
+parsed 124

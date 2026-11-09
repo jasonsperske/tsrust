@@ -1,0 +1,5 @@
+primes: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+gcd(1071, 462) = 21
+sorted: [1, 2, 5, 5, 6, 9]
+find 6: Some(4), find 3: None
+1 2 Fizz 4 Buzz Fizz 7 8 Fizz Buzz 11 Fizz 13 14 FizzBuzz

@@ -1,0 +1,90 @@
+/* Playground layout: toolbar, editor on the left, compiler output tabs on the right. */
+body.playground { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+.toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.toolbar select, .toolbar button {
+  font: 14px var(--sans); padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--fg); cursor: pointer;
+}
+.toolbar select { max-width: 280px; }
+.toolbar button:hover:not(:disabled) { border-color: var(--accent); }
+.toolbar button:disabled { opacity: 0.5; cursor: default; }
+.toolbar button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.status { font-size: 13px; color: var(--fg-soft); margin-left: auto; }
+.status.ok { color: var(--ok); }
+.status.error { color: var(--err); }
+.status.busy { color: var(--accent-2); }
+
+.workspace { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 0; }
+.editor-pane { border-right: 1px solid var(--border); min-height: 0; display: flex; }
+.output-pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+
+/* The editor: a transparent textarea over a highlighted <pre>. */
+.editor { flex: 1; display: flex; min-height: 0; font: 14px/1.5 var(--mono); background: var(--bg-code); }
+.gutter {
+  margin: 0; padding: 12px 8px 12px 12px; text-align: right; color: var(--tok-comment); user-select: none;
+  overflow: hidden; border-right: 1px solid var(--border); min-width: 3.2em; font: inherit;
+}
+.code-area { position: relative; flex: 1; min-width: 0; }
+.code-area pre, .code-area textarea {
+  position: absolute; inset: 0; margin: 0; padding: 12px; border: 0; font: inherit; tab-size: 4;
+  white-space: pre; overflow: auto; letter-spacing: normal;
+}
+.code-area pre { pointer-events: none; color: var(--fg); }
+.code-area textarea {
+  background: transparent; color: transparent; caret-color: var(--fg); resize: none; outline: none;
+}
+.code-area textarea::selection { background: rgba(47, 111, 179, 0.3); color: transparent; }
+.mark-error { text-decoration: underline wavy var(--err); text-decoration-skip-ink: none; text-underline-offset: 3px; }
+.mark-warning { text-decoration: underline wavy var(--warn); text-underline-offset: 3px; }
+
+/* Tabs */
+.tabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--border); overflow-x: auto; flex-shrink: 0; }
+.tabs button {
+  font: 13px var(--sans); padding: 7px 12px; border: 1px solid transparent; border-bottom: none;
+  border-radius: 7px 7px 0 0; background: transparent; color: var(--fg-soft); cursor: pointer; white-space: nowrap;
+}
+.tabs button[aria-selected="true"] { background: var(--bg-soft); border-color: var(--border); color: var(--fg); font-weight: 600; }
+.tabs button.has-errors::after { content: " ●"; color: var(--err); }
+.tab-body { flex: 1; overflow: auto; padding: 12px 16px 40px; background: var(--bg-soft); }
+.tab-note { color: var(--fg-soft); font-size: 14px; margin: 0 0 10px; }
+pre.out { margin: 0 0 12px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: auto; font: 13px/1.45 var(--mono); white-space: pre; }
+pre.out.stderr { color: var(--err); }
+.diag-error { color: var(--err); font-weight: 700; }
+.diag-warning { color: var(--warn); font-weight: 700; }
+
+table.grid { border-collapse: collapse; width: 100%; font-size: 13px; background: var(--bg); }
+table.grid th, table.grid td { border: 1px solid var(--border); padding: 3px 8px; text-align: left; }
+table.grid th { position: sticky; top: -12px; background: var(--bg-soft); }
+td.num { color: var(--fg-soft); font-family: var(--mono); white-space: nowrap; }
+code.ty { color: var(--tok-type); }
+.pill { display: inline-block; padding: 0 6px; border-radius: 4px; font: 11px var(--mono); background: var(--bg-soft); }
+.pill-keyword { color: var(--tok-kw); } .pill-ident { color: var(--fg); } .pill-int, .pill-float { color: var(--tok-num); }
+.pill-string, .pill-char { color: var(--tok-str); } .pill-lifetime { color: var(--tok-life); } .pill-punct { color: var(--fg-soft); }
+
+.ast { font: 13px/1.5 var(--mono); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+.ast details { margin-left: 14px; }
+.ast > details { margin-left: 0; }
+.ast summary { cursor: pointer; }
+.ast-leaf { margin-left: 28px; }
+.ast-key { color: var(--fg-soft); }
+.ast-kind { color: var(--accent); font-weight: 600; }
+.ast-val { color: var(--tok-str); }
+.ast-dim { color: var(--fg-soft); }
+
+.stages { display: flex; flex-direction: column; gap: 6px; max-width: 560px; }
+.stage { display: grid; grid-template-columns: 80px 1fr 80px; align-items: center; gap: 8px; font-size: 13px; }
+.stage-name { font-family: var(--mono); }
+.stage .bar { height: 12px; border-radius: 3px; background: var(--accent-2); }
+.stage-failed .bar { background: var(--err); }
+.stage-skipped { opacity: 0.5; }
+.stage-ms { text-align: right; color: var(--fg-soft); font-family: var(--mono); }
+.crates { font-size: 14px; }
+
+@media (max-width: 860px) {
+  body.playground { height: auto; overflow: visible; }
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .editor-pane { height: 55vh; border-right: none; border-bottom: 1px solid var(--border); }
+  .output-pane { min-height: 60vh; }
+  .status { margin-left: 0; width: 100%; }
+}

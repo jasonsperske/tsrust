@@ -1,0 +1,4 @@
+Rect { width: 3, height: 4, id: 7 }
+area = 12, id = 7
+scaled = 51
+SCALE = 10

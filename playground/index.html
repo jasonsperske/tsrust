@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TSRust Playground</title>
+  <meta name="description" content="Compile and run Rust in your browser with TSRust, a Rust compiler written in TypeScript. Inspect tokens, the AST, inferred types, MIR and bytecode." />
+  <link rel="stylesheet" href="../style.css" />
+  <link rel="stylesheet" href="playground.css" />
+</head>
+<body class="playground">
+  <header class="topbar">
+    <a class="brand" href="../index.html"><span class="logo">TS<b>Rust</b></span><span class="tagline">two can play at this game</span></a>
+    <nav>
+      <a href="../index.html">Docs</a>
+      <a href="./" aria-current="page">Playground</a>
+    </nav>
+  </header>
+
+  <div class="toolbar">
+    <label class="select">
+      <span class="sr-only">Example</span>
+      <select id="example"></select>
+    </label>
+    <label class="select" id="file-picker" hidden>
+      <span class="sr-only">File</span>
+      <select id="file"></select>
+    </label>
+    <button id="run" class="primary" title="Compile and run (Ctrl+Enter)">Run</button>
+    <button id="check" title="Check without running (Ctrl+Shift+Enter)">Check</button>
+    <button id="download" title="Download the compiled bytecode" disabled>Download .tsrb</button>
+    <label class="select">
+      <span class="sr-only">Executable target</span>
+      <select id="target" title="Operating system for native executables">
+        <option value="linux">Linux (ELF)</option>
+        <option value="macos">macOS (Mach-O)</option>
+        <option value="windows">Windows (.exe)</option>
+      </select>
+    </label>
+    <button id="download-exe" title="Compile to x86-64 machine code and download a native executable" disabled>Download executable</button>
+    <button id="share" title="Copy a link to this program">Share</button>
+    <span id="status" class="status" role="status"></span>
+  </div>
+
+  <main class="workspace">
+    <section class="editor-pane" aria-label="Editor">
+      <div class="editor" id="editor">
+        <pre class="gutter" id="gutter" aria-hidden="true"></pre>
+        <div class="code-area">
+          <pre class="highlight" id="highlight" aria-hidden="true"></pre>
+          <textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Rust source code"></textarea>
+        </div>
+      </div>
+    </section>
+
+    <section class="output-pane" aria-label="Compiler output">
+      <div class="tabs" role="tablist" id="tabs"></div>
+      <div class="tab-body" id="tab-body"></div>
+    </section>
+  </main>
+
+  <script type="module" src="playground.js"></script>
+</body>
+</html>

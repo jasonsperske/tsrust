@@ -1,0 +1,7 @@
+a + b = (1.5, 1.0)
+a * 3 = (3.0, 6.0)
+-a = (-1.0, -2.0)
+debug: Vec2 { x: 1.5, y: 1.0 }, equal? true
+total: $21.59
+price < total? true
+Hello, world

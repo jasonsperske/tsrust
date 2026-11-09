@@ -1,0 +1,7 @@
+square with area 4.0
+a round circle of radius 1
+largest i32: 100
+largest char: y
+larger is b = 10
+Pair { a: 5, b: 10 }
+displayed: Square(3), as string: Square(3)

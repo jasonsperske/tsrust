@@ -1,0 +1,104 @@
+/* TSRust site styles: shared by the docs and the playground. */
+:root {
+  --bg: #fbfaf8;
+  --bg-soft: #f2efea;
+  --bg-code: #f4f1ec;
+  --fg: #1f1d1a;
+  --fg-soft: #5d5850;
+  --border: #e2ddd5;
+  --accent: #b7410e;      /* rust */
+  --accent-2: #2f6fb3;    /* typescript blue */
+  --accent-soft: #fbe9df;
+  --ok: #2e7d4f;
+  --err: #c0392b;
+  --warn: #b7791f;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --tok-kw: #a3368c; --tok-type: #2f6fb3; --tok-str: #2e7d4f; --tok-num: #b7410e;
+  --tok-comment: #8a847a; --tok-macro: #8f5b00; --tok-fn: #1d5f8a; --tok-life: #7a4fb5;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17181b; --bg-soft: #1f2125; --bg-code: #1c1e22; --fg: #e8e6e1; --fg-soft: #a6a29a;
+    --border: #2e3136; --accent: #f08a5d; --accent-2: #6fa8e8; --accent-soft: #3a2419;
+    --ok: #5fc48a; --err: #ff6b5e; --warn: #e3b04b;
+    --tok-kw: #d98ad0; --tok-type: #7fb7f0; --tok-str: #8fd49f; --tok-num: #f3a07a;
+    --tok-comment: #7d7a73; --tok-macro: #e6c06b; --tok-fn: #8cc8ef; --tok-life: #b99cf0;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #17181b; --bg-soft: #1f2125; --bg-code: #1c1e22; --fg: #e8e6e1; --fg-soft: #a6a29a;
+  --border: #2e3136; --accent: #f08a5d; --accent-2: #6fa8e8; --accent-soft: #3a2419;
+  --ok: #5fc48a; --err: #ff6b5e; --warn: #e3b04b;
+  --tok-kw: #d98ad0; --tok-type: #7fb7f0; --tok-str: #8fd49f; --tok-num: #f3a07a;
+  --tok-comment: #7d7a73; --tok-macro: #e6c06b; --tok-fn: #8cc8ef; --tok-life: #b99cf0;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.6 var(--sans); }
+a { color: var(--accent-2); }
+code, pre { font-family: var(--mono); font-size: 0.9em; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+/* Top bar */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-soft);
+}
+.brand { display: flex; align-items: baseline; gap: 12px; text-decoration: none; color: var(--fg); min-width: 0; }
+.logo { font: 700 22px/1 var(--mono); letter-spacing: -0.5px; color: var(--accent-2); }
+.logo b { color: var(--accent); }
+.tagline { color: var(--fg-soft); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar nav { display: flex; gap: 16px; }
+.topbar nav a { color: var(--fg-soft); text-decoration: none; font-weight: 500; }
+.topbar nav a[aria-current="page"], .topbar nav a:hover { color: var(--accent); }
+
+/* Docs layout */
+.docs { display: grid; grid-template-columns: 260px minmax(0, 1fr); max-width: 1180px; margin: 0 auto; }
+.sidebar { padding: 24px 16px; border-right: 1px solid var(--border); position: sticky; top: 0; align-self: start; max-height: 100vh; overflow: auto; }
+.sidebar ol { list-style: none; padding: 0; margin: 0; }
+.sidebar li a { display: block; padding: 5px 10px; border-radius: 6px; color: var(--fg-soft); text-decoration: none; font-size: 15px; }
+.sidebar li a:hover { background: var(--bg-soft); color: var(--fg); }
+.sidebar li a[aria-current="page"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.sidebar .cta { display: block; margin: 16px 10px 0; padding: 8px 12px; border-radius: 8px; background: var(--accent); color: #fff; text-align: center; text-decoration: none; font-weight: 600; }
+article { padding: 32px 48px 80px; min-width: 0; }
+article h1 { font-size: 2.1em; line-height: 1.2; margin-top: 0; }
+article h2 { margin-top: 2em; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+article h3 { margin-top: 1.6em; }
+article pre { background: var(--bg-code); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow-x: auto; line-height: 1.45; }
+article :not(pre) > code { background: var(--bg-code); padding: 1px 5px; border-radius: 4px; }
+article table { border-collapse: collapse; margin: 1em 0; display: block; overflow-x: auto; }
+article th, article td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; }
+article th { background: var(--bg-soft); }
+article blockquote { margin: 1em 0; padding: 4px 16px; border-left: 4px solid var(--accent); background: var(--bg-soft); color: var(--fg-soft); }
+article img { max-width: 100%; }
+pre.mermaid { background: transparent; border: none; text-align: center; }
+.pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); }
+.pager a { text-decoration: none; }
+.hero { padding: 28px; margin: 0 0 32px; border-radius: 14px; background: linear-gradient(135deg, var(--accent-soft), var(--bg-soft)); border: 1px solid var(--border); }
+.hero p { margin: 0 0 14px; font-size: 1.1em; }
+.hero .button { display: inline-block; padding: 9px 18px; border-radius: 8px; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; margin-right: 8px; }
+.hero .button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+
+/* Rust syntax colors (shared by docs code blocks and the playground editor) */
+.tok-kw { color: var(--tok-kw); }
+.tok-type { color: var(--tok-type); }
+.tok-str, .tok-lit { color: var(--tok-str); }
+.tok-num { color: var(--tok-num); }
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-macro { color: var(--tok-macro); }
+.tok-fn { color: var(--tok-fn); }
+.tok-life { color: var(--tok-life); }
+
+@media (max-width: 860px) {
+  .docs { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); padding: 12px 16px; }
+  .sidebar ol { display: flex; flex-wrap: wrap; gap: 4px; }
+  .sidebar li a { font-size: 13px; padding: 3px 8px; background: var(--bg-soft); }
+  article { padding: 20px 16px 60px; }
+  .tagline { display: none; }
+}

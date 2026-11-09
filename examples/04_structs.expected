@@ -1,0 +1,13 @@
+Point { x: 3.0, y: 4.0 } is 5 from the origin
+p = Point { x: 4.0, y: 5.0 }, q = Point { x: 3.0, y: 4.0 }, equal? false
+area = 50
+contains p? true
+Rectangle {
+    top_left: Point {
+        x: 0.0,
+        y: 0.0,
+    },
+    width: 10.0,
+    height: 5.0,
+}
+42.5 meters

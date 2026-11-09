@@ -1,0 +1,35 @@
+{
+  "name": "tsrust",
+  "version": "0.1.0",
+  "description": "TSRust — two can play at this game: a port of Rust to TypeScript. A teaching compiler for a subset of Rust.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "tsrust": "./src/cli.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-reporter=spec \"tests/**/*.test.ts\"",
+    "tsrust": "node src/cli.ts",
+    "build:site": "node scripts/build-site.ts",
+    "serve": "npm run build:site && npx --yes http-server site -p 8080 -c-1",
+    "gen": "node scripts/gen-std.ts",
+    "pretest": "npm run gen --silent",
+    "conformance": "node scripts/conformance.ts",
+    "build:runtime": "node scripts/build-runtime.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.25.12",
+    "marked": "^15.0.12",
+    "typescript": "5.9"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jasonsperske/tsrust.git"
+  },
+  "homepage": "https://jasonsperske.github.io/tsrust/"
+}

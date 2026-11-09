@@ -1,0 +1,9 @@
+'the' appears 3 times
+9 distinct words
+no cats
+[1, 4, 16, 25, 49, 64]
+reversed: [64, 49, 25, 16, 4, 1], max = Some(64)
+removed 64, contains 4? true
+Hello, world (12 bytes) -> HELLO, WORLD
+0:h 1:é 2:l 3:l 4:o 
+sum of 1,2,3,4 = 10

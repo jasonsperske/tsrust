@@ -1,0 +1,4 @@
+Cons(1, Cons(2, Cons(3, Nil)))
+sum = 6
+in order: [20, 30, 40, 50, 60, 70, 80]
+42

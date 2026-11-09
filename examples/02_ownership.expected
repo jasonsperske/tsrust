@@ -1,0 +1,5 @@
+b = hello
+taken: 5
+borrowed: 5, still usable: hello
+n = 5, m = 5
+round trip!
