@@ -67,6 +67,8 @@ export interface Def {
   paramIndex?: number;
   /** For generic params: their bounds as written. */
   bounds?: A.Path[];
+  /** For `const N: usize` generic params. */
+  isConstParam?: boolean;
   /** True for function declarations without a body in `std` (VM intrinsics). */
   intrinsic?: boolean;
 }

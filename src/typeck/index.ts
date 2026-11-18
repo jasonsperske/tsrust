@@ -32,6 +32,7 @@ export interface TypeckOutput {
 export function typecheck(res: ResolveResults, diags: Diagnostics): TypeckOutput {
   const tcx = new TyCtxt(res, diags);
   const results = emptyResults();
+  tcx.closures = results.closures;
 
   checkTraitImpls(tcx);
   checkRecursiveTypes(tcx);
@@ -50,6 +51,7 @@ export function typecheck(res: ResolveResults, diags: Diagnostics): TypeckOutput
     const ex = new ExhaustivenessChecker(tcx, results, diags);
     for (const def of results.checkedBodies) {
       const fn = tcx.defs[def].node as A.FnItem;
+      ex.enterBody(def);
       for (const p of fn.params) ex.checkIrrefutable(p.pat, outerPatTy(results, p.pat), "function argument");
       if (fn.body) walkPatterns(fn.body, results, ex);
     }
@@ -77,6 +79,7 @@ function outerPatTy(r: TypeckResults, p: A.Pattern): Ty | undefined {
 function walkPatterns(e: A.Expr, r: TypeckResults, ex: ExhaustivenessChecker) {
   if (e.kind === "match") ex.checkMatch(e);
   if (e.kind === "for") ex.checkIrrefutable(e.pat, outerPatTy(r, e.pat), "`for` loop binding");
+  if (e.kind === "closure") for (const p of e.params) ex.checkIrrefutable(p.pat, outerPatTy(r, p.pat), "closure argument");
   if (e.kind === "block") {
     for (const s of e.stmts) if (s.kind === "let") ex.checkIrrefutable(s.pat, outerPatTy(r, s.pat), "local binding");
   }
@@ -96,6 +99,11 @@ function checkTraitImpls(tcx: TyCtxt) {
     const trait = header.trait.trait;
     const traitNode = tcx.defs[trait].node as A.TraitItem;
     const info = tcx.traitInfo(trait);
+    if (traitNode.isUnsafe && !node.isUnsafe) {
+      tcx.diags.error("typeck", node.span, `the trait \`${tcx.nameOf(trait)}\` requires an \`unsafe impl\` declaration`, "E0200");
+    } else if (!traitNode.isUnsafe && node.isUnsafe) {
+      tcx.diags.error("typeck", node.span, `implementing the trait \`${tcx.nameOf(trait)}\` is not unsafe`, "E0199");
+    }
     const missing: string[] = [];
     for (const m of traitNode.items) {
       if (!m.body && !node.items.some((f) => f.name === m.name)) missing.push(`\`${m.name}\``);

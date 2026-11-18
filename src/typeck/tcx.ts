@@ -30,6 +30,7 @@ import type { Diagnostics, Span } from "../diagnostics.ts";
 import type * as A from "../parser/ast.ts";
 import type { Def, DefId, PartialRes } from "../resolve/defs.ts";
 import type { ResolveResults } from "../resolve/resolver.ts";
+import type { ClosureInfo } from "./results.ts";
 import { ERROR, NEVER, UNIT, showTy, substitute, type Subst, type Ty } from "./types.ts";
 
 export interface TraitRef {
@@ -83,6 +84,8 @@ export interface AstConvCtx {
   selfTy?: Ty;
   /** Inside function bodies, `_` and omitted generic args become inference variables. */
   fresh?: () => Ty;
+  /** In a function's return type: `impl Trait` becomes an opaque type owned by this function. */
+  opaqueOwner?: DefId;
 }
 
 export class TyCtxt {
@@ -105,6 +108,10 @@ export class TyCtxt {
   readonly traitImpls = new Map<DefId, DefId[]>();
   /** ADT DefId → derived trait DefIds. */
   readonly derives = new Map<DefId, Set<DefId>>();
+  /** Every closure in the program; shared with the type-check results. */
+  closures = new Map<A.NodeId, ClosureInfo>();
+  /** `impl Trait` return types by the id of their type expression. */
+  readonly opaques = new Map<number, { owner: DefId; bounds: A.Path[]; hidden?: Ty }>();
 
   constructor(res: ResolveResults, diags: Diagnostics) {
     this.res = res;
@@ -234,6 +241,13 @@ export class TyCtxt {
       for (const p of this.res.genericsOf.get(def) ?? []) {
         for (const bound of this.defs[p].bounds ?? []) preds.push(...this.boundToPredicates(this.paramTy(p), bound, ctx));
       }
+      const generics = (d.node as { generics?: A.Generics } | undefined)?.generics;
+      if (d.kind === "fn" || d.kind === "impl" || d.kind === "struct" || d.kind === "enum" || d.kind === "trait") {
+        for (const w of generics?.where ?? []) {
+          const self = this.astToTy(w.ty, ctx);
+          for (const bound of w.bounds) preds.push(...this.boundToPredicates(self, bound, ctx));
+        }
+      }
     }
     this.predCache.set(def, preds);
     return preds;
@@ -245,7 +259,10 @@ export class TyCtxt {
     if (!tr) return [];
     const preds: Predicate[] = [{ kind: "trait", self, trait: tr.trait, args: tr.args }];
     for (const b of bound.segments[bound.segments.length - 1].bindings ?? []) {
-      preds.push({ kind: "proj", self, trait: tr.trait, traitArgs: tr.args, name: b.name, ty: this.astToTy(b.ty, ctx) });
+      // `F: Fn(A) -> B`: `Output` is declared on the supertrait `FnOnce`, with the same arguments.
+      // Likewise `I: DoubleEndedIterator<Item = T>` names `Iterator::Item`.
+      const owner = this.isFnFamily(tr.trait) ? { trait: this.lang("FnOnce"), args: tr.args } : this.elaborate(tr).find((t) => this.traitInfo(t.trait).assocTypes.has(b.name)) ?? tr;
+      preds.push({ kind: "proj", self, trait: owner.trait, traitArgs: owner.args, name: b.name, ty: this.astToTy(b.ty, ctx) });
     }
     return preds;
   }
@@ -272,6 +289,107 @@ export class TyCtxt {
     return { trait, args };
   }
 
+  isFnFamily(trait: DefId): boolean {
+    return ["Fn", "FnMut", "FnOnce"].some((n) => this.res.lang.get(n) === trait);
+  }
+
+  /** The bounds of an opaque type, as predicates about `t` itself. */
+  opaquePredicates(t: Extract<Ty, { k: "opaque" }>): Predicate[] {
+    const o = this.opaques.get(t.index);
+    if (!o) return [];
+    const params = this.allParams(o.owner);
+    const subst: Subst = new Map(params.map((p, i) => [p, t.args[i]]));
+    const inst = (x: Ty) => substitute(x, subst);
+    const ctx: AstConvCtx = { selfTy: this.selfTyOf(o.owner) };
+    return o.bounds.flatMap((b) => this.boundToPredicates(t, b, ctx)).map((p): Predicate =>
+      p.kind === "trait" ? { ...p, args: p.args.map(inst) } : { ...p, traitArgs: p.traitArgs.map(inst), ty: inst(p.ty) });
+  }
+
+  /** What calling a closure, function item or fn pointer takes and returns. */
+  callableSig(t: Ty): { params: Ty[]; ret: Ty } | undefined {
+    if (t.k === "fnptr") return { params: t.params, ret: t.ret };
+    if (t.k === "closure") {
+      const c = this.closures.get(t.id);
+      if (!c) return undefined;
+      const subst: Subst = new Map(this.allParams(c.owner).map((p, i) => [p, t.args[i]]));
+      return { params: c.params.map((p) => substitute(p, subst)), ret: substitute(c.ret, subst) };
+    }
+    if (t.k !== "fndef") return undefined;
+    const d = this.defs[t.def];
+    const subst: Subst = new Map(this.allParams(t.def).map((p, i) => [p, t.substs[i]]));
+    if (d.kind === "fn") {
+      const sig = this.fnSig(t.def);
+      return { params: sig.params.map((p) => substitute(p, subst)), ret: substitute(sig.ret, subst) };
+    }
+    // A tuple struct or tuple variant used as a function.
+    const adt = d.kind === "variant" ? d.parent! : d.id;
+    const v = this.variants(adt).find((x) => x.def === t.def)!;
+    return { params: v.fields.map((f) => substitute(f.ty, subst)), ret: { k: "adt", def: adt, args: t.substs } };
+  }
+
+  /** The type reached by following captured-place steps from `t`. */
+  projTy(t: Ty, proj: { k: "field" | "deref"; index?: number }[]): Ty {
+    for (const p of proj) {
+      if (p.k === "deref") {
+        if (t.k === "ref" || t.k === "ptr") t = t.inner;
+        else if (t.k === "adt") t = this.isLang(t.def, "String") ? { k: "str" } : this.isLang(t.def, "Vec") ? { k: "slice", elem: t.args[0] } : t.args[0] ?? ERROR;
+        else if (t.k === "array") t = { k: "slice", elem: t.elem };
+        else t = ERROR;
+      } else if (t.k === "tuple") t = t.elems[p.index!] ?? ERROR;
+      else if (t.k === "adt") {
+        const adt: Extract<Ty, { k: "adt" }> = t;
+        const f = this.variants(adt.def)[0]?.fields[p.index!];
+        t = f ? substitute(f.ty, new Map((this.res.genericsOf.get(adt.def) ?? []).map((g, i) => [g, adt.args[i]]))) : ERROR;
+      } else if (t.k === "closure") t = ERROR;
+      else t = ERROR;
+    }
+    return t;
+  }
+
+  /** Evaluate an array length or const generic argument. */
+  constToTy(e: A.Expr, ctx: AstConvCtx): Ty {
+    const fold = (e: A.Expr): number | Ty | undefined => {
+      switch (e.kind) {
+        case "lit": return e.value.kind === "int" ? e.value.value : undefined;
+        case "cast": return fold(e.expr);
+        case "block": return e.stmts.length === 0 && e.tail ? fold(e.tail) : undefined;
+        case "path": {
+          const pr = this.res.paths.get(e.path.id);
+          if (pr?.base.kind !== "def" || pr.unresolved.length) return undefined;
+          const d = this.defs[pr.base.def];
+          if (d.isConstParam) return this.paramTy(d.id);
+          if (d.kind === "const") return fold((d.node as A.ConstItem).value);
+          return undefined;
+        }
+        case "binary": {
+          const a = fold(e.left), b = fold(e.right);
+          if (typeof a !== "number" || typeof b !== "number") return undefined;
+          switch (e.op) {
+            case "+": return a + b;
+            case "-": return a - b;
+            case "*": return a * b;
+            case "/": return b === 0 ? undefined : Math.trunc(a / b);
+            case "%": return b === 0 ? undefined : a % b;
+            case "<<": return a * 2 ** b;
+            case ">>": return Math.floor(a / 2 ** b);
+          }
+          return undefined;
+        }
+      }
+      return undefined;
+    };
+    void ctx;
+    const v = fold(e);
+    if (typeof v === "number") return { k: "constval", n: v };
+    if (v) return v;
+    if (e.kind === "path" && this.res.paths.get(e.path.id)?.base.kind === "local") {
+      this.diags.error("typeck", e.span, "attempt to use a non-constant value in a constant", "E0435");
+      return ERROR;
+    }
+    this.diags.error("typeck", e.span, "TSRust can only evaluate integer literals, constants, const parameters and arithmetic on them here");
+    return ERROR;
+  }
+
   // -------------------------------------------------------------------------
   // AST type → Ty
   // -------------------------------------------------------------------------
@@ -281,6 +399,25 @@ export class TyCtxt {
       case "ref": return { k: "ref", mutable: t.mutable, inner: this.astToTy(t.inner, ctx) };
       case "tuple": return t.elems.length === 0 ? UNIT : { k: "tuple", elems: t.elems.map((e) => this.astToTy(e, ctx)) };
       case "never": return NEVER;
+      case "ptr": return { k: "ptr", mutable: t.mutable, inner: this.astToTy(t.inner, ctx) };
+      case "slice": return { k: "slice", elem: this.astToTy(t.elem, ctx) };
+      case "array": {
+        const elem = this.astToTy(t.elem, ctx);
+        if (t.len) return { k: "array", elem, len: this.constToTy(t.len, ctx) };
+        if (ctx.fresh) return { k: "array", elem, len: ctx.fresh() };
+        this.diags.error("typeck", t.span, "the placeholder `_` is not allowed within types on item signatures", "E0121");
+        return ERROR;
+      }
+      case "fnptr": return { k: "fnptr", params: t.params.map((p) => this.astToTy(p, ctx)), ret: t.ret ? this.astToTy(t.ret, ctx) : UNIT, isUnsafe: t.isUnsafe };
+      case "constArg": return this.constToTy(t.value, ctx);
+      case "implTrait": {
+        if (ctx.opaqueOwner === undefined) {
+          this.diags.error("typeck", t.span, "`impl Trait` is not allowed here", "E0562");
+          return ERROR;
+        }
+        this.opaques.set(t.id, { owner: ctx.opaqueOwner, bounds: t.bounds });
+        return { k: "opaque", def: ctx.opaqueOwner, index: t.id, args: this.allParams(ctx.opaqueOwner).map((p) => this.paramTy(p)) };
+      }
       case "infer":
         if (ctx.fresh) return ctx.fresh();
         this.diags.error("typeck", t.span, "the placeholder `_` is not allowed within types on item signatures", "E0121");
@@ -498,7 +635,7 @@ export class TyCtxt {
       params.push(fn.selfParam.kind === "value" ? s : { k: "ref", mutable: fn.selfParam.kind === "refMut", inner: s });
     }
     for (const p of fn.params) params.push(this.astToTy(p.ty, ctx));
-    const sig: FnSig = { params, ret: fn.ret ? this.astToTy(fn.ret, ctx) : UNIT, selfKind: fn.selfParam?.kind, hasSelf: !!fn.selfParam };
+    const sig: FnSig = { params, ret: fn.ret ? this.astToTy(fn.ret, { ...ctx, opaqueOwner: def }) : UNIT, selfKind: fn.selfParam?.kind, hasSelf: !!fn.selfParam };
     this.sigCache.set(def, sig);
     return sig;
   }
@@ -553,7 +690,8 @@ export function headKey(t: Ty): string | undefined {
   switch (t.k) {
     case "adt": return `adt${t.def}`;
     case "int": case "float": return t.name;
-    case "bool": case "char": case "str": return t.k;
+    case "bool": case "char": case "str": case "slice": case "array": return t.k;
+    case "ptr": return t.mutable ? "ptrMut" : "ptrConst";
     default: return undefined;
   }
 }

@@ -24,6 +24,8 @@ export type TypeDesc =
   | { k: "ref"; inner: number }
   | { k: "box"; inner: number }
   | { k: "vec"; elem: number }
+  | { k: "slice"; elem: number }
+  | { k: "ptr" }
   | { k: "map"; key: number; value: number }
   | { k: "struct"; name: string; kind: "named" | "tuple" | "unit"; fields: { name: string; ty: number }[] }
   | { k: "enum"; name: string; variants: { name: string; kind: "named" | "tuple" | "unit"; fields: { name: string; ty: number }[] }[] }

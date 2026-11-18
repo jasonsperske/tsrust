@@ -40,7 +40,8 @@ import type * as A from "../parser/ast.ts";
 import type { DefId } from "../resolve/defs.ts";
 import { InferCtxt } from "../typeck/infer.ts";
 import type { TypeckOutput } from "../typeck/index.ts";
-import type { Callee, TypeckResults } from "../typeck/results.ts";
+import { isRestPat } from "../typeck/exhaustive.ts";
+import { isPromotable, type Callee, type ClosureInfo, type TypeckResults } from "../typeck/results.ts";
 import type { TyCtxt } from "../typeck/tcx.ts";
 import { TraitSolver } from "../typeck/traits.ts";
 import { ERROR, UNIT, substitute, tyKey, type Subst, type Ty } from "../typeck/types.ts";
@@ -54,11 +55,11 @@ type Target =
   | { kind: "intrinsic"; name: string; substs?: Ty[] }
   | { kind: "builtin"; trait: string; method: string; self: Ty };
 
-interface Instance {
-  index: number;
-  def: DefId;
-  subst: Subst;
-}
+type Instance =
+  | { index: number; kind: "fn"; def: DefId; subst: Subst }
+  | { index: number; kind: "closure"; info: ClosureInfo; subst: Subst }
+  /** A plain function with the same behavior as `callee`, so it can be used as a `fn` pointer. */
+  | { index: number; kind: "shim"; callee: Ty; argc: number };
 
 export function generate(tc: TypeckOutput, sources: SourceMap, diags: Diagnostics): Program | undefined {
   const main = tc.tcx.res.main;
@@ -66,8 +67,10 @@ export function generate(tc: TypeckOutput, sources: SourceMap, diags: Diagnostic
     return undefined;
   }
   const g = new ProgramBuilder(tc, sources, diags);
-  const entry = g.instance(main, []);
+  let entry = g.instance(main, []);
   g.drain();
+  // `static` items are initialized before `main` starts.
+  if (g.globals.length) entry = g.startFunction(entry);
   return { constants: g.constants, types: g.types, intrinsics: g.intrinsics, locs: g.locs, functions: g.functions, entry };
 }
 
@@ -90,6 +93,9 @@ class ProgramBuilder {
   private readonly copyCache = new Map<string, boolean>();
   readonly sources: SourceMap;
   readonly diags: Diagnostics;
+  /** `static` items and promoted constants in use; each one's position is its global slot. */
+  readonly globals: { value: A.Expr; subst: Subst; def?: DefId }[] = [];
+  private readonly promoted = new Map<string, number>();
 
   constructor(tc: TypeckOutput, sources: SourceMap, diags: Diagnostics) {
     this.tcx = tc.tcx;
@@ -97,6 +103,41 @@ class ProgramBuilder {
     this.sources = sources;
     this.diags = diags;
     this.solver = new TraitSolver(this.tcx, this.infcx, []);
+    this.solver.reveal = true;
+  }
+
+  globalIndex(def: DefId): number {
+    let i = this.globals.findIndex((g) => g.def === def);
+    if (i < 0) i = this.globals.push({ def, value: (this.tcx.defs[def].node as A.ConstItem).value, subst: new Map() }) - 1;
+    return i;
+  }
+
+  /** The global holding a constant whose address is taken: `&[1, 2]`. */
+  promotedIndex(e: A.Expr, subst: Subst): number {
+    const key = `${e.id}<${[...subst.values()].map(tyKey).join(",")}>`;
+    let i = this.promoted.get(key);
+    if (i === undefined) {
+      i = this.globals.push({ value: e, subst }) - 1;
+      this.promoted.set(key, i);
+    }
+    return i;
+  }
+
+  /** A function computing a global's initial value. */
+  globalInit(i: number): number {
+    const g = this.globals[i];
+    const index = this.functions.length;
+    this.functions.push({ name: `{init global ${i}}`, params: 0, locals: 0, code: [], lines: [] });
+    this.functions[index] = { ...new FnCompiler(this, g.subst).compileInit(g.value), name: `{init global ${i}}` };
+    return index;
+  }
+
+  startFunction(main: number): number {
+    const index = this.functions.length;
+    this.functions.push({ name: "{start}", params: 0, locals: 0, code: [], lines: [] });
+    const fc = new FnCompiler(this, new Map());
+    this.functions[index] = { ...fc.compileStart(main), name: "{start}" };
+    return index;
   }
 
   constant(v: number | string): number {
@@ -153,6 +194,7 @@ class ProgramBuilder {
   needsCopy(t: Ty): boolean {
     if (t.k === "tuple") return t.elems.length > 0 && this.isCopy(t);
     if (t.k === "adt") return !this.tcx.isNativeAdt(t.def) && this.isCopy(t);
+    if (t.k === "array" || t.k === "closure") return this.isCopy(t);
     return false;
   }
 
@@ -178,6 +220,16 @@ class ProgramBuilder {
       case "never": return { k: "never" };
       case "tuple": return t.elems.length === 0 ? { k: "unit" } : { k: "tuple", elems: t.elems.map((e) => this.typeDesc(e)) };
       case "ref": return { k: "ref", inner: this.typeDesc(t.inner) };
+      case "ptr": return { k: "ptr" };
+      case "array": return { k: "vec", elem: this.typeDesc(t.elem) }; // an array is laid out like a Vec
+      case "slice": return { k: "slice", elem: this.typeDesc(t.elem) };
+      case "fndef": return { k: "unit" };
+      case "closure": {
+        // A closure value is a tuple of what it captured.
+        const info = this.r.closures.get(t.id)!;
+        const elems = (info.captures ?? []).map((c) => this.typeDesc(this.captureTy(c, this.closureSubst(t))));
+        return elems.length ? { k: "tuple", elems } : { k: "unit" };
+      }
       case "adt": {
         const lang = (n: string) => this.tcx.isLang(t.def, n);
         if (lang("Vec")) return { k: "vec", elem: this.typeDesc(t.args[0]) };
@@ -193,6 +245,17 @@ class ProgramBuilder {
       }
       default: return { k: "opaque", name: t.k };
     }
+  }
+
+  closureSubst(t: Extract<Ty, { k: "closure" }>): Subst {
+    const info = this.r.closures.get(t.id)!;
+    return new Map(this.tcx.allParams(info.owner).map((p, i) => [p, t.args[i]]));
+  }
+
+  /** The type of a closure's field for capture `c`. */
+  captureTy(c: { by?: "ref" | "mut"; ty: Ty }, subst: Subst): Ty {
+    const ty = this.normalize(substitute(c.ty, subst));
+    return c.by ? { k: "ref", mutable: c.by === "mut", inner: ty } : ty;
   }
 
   numKind(t: Ty): number {
@@ -212,16 +275,51 @@ class ProgramBuilder {
     const label = this.tcx.pathOf(def) + (substs.length ? `::<${substs.map((s) => this.tcx.show(s)).join(", ")}>` : "");
     this.functions.push({ name: label, params: 0, locals: 0, code: [], lines: [] });
     this.instances.set(key, index);
-    this.queue.push({ index, def, subst });
+    this.queue.push({ index, kind: "fn", def, subst });
+    return index;
+  }
+
+  /** The compiled body of a closure, for this instantiation of its enclosing function. */
+  closureInstance(t: Extract<Ty, { k: "closure" }>): number {
+    const key = tyKey(t);
+    const existing = this.instances.get(key);
+    if (existing !== undefined) return existing;
+    const index = this.functions.length;
+    const info = this.r.closures.get(t.id)!;
+    this.functions.push({ name: `${this.tcx.pathOf(info.owner)}::{closure#${t.id}}`, params: 0, locals: 0, code: [], lines: [] });
+    this.instances.set(key, index);
+    this.queue.push({ index, kind: "closure", info, subst: this.closureSubst(t) });
+    return index;
+  }
+
+  /** A function index usable as a `fn` pointer to `t`. */
+  fnPointer(t: Ty): number {
+    if (t.k === "fndef" && this.tcx.defs[t.def].kind === "fn") {
+      const target = this.resolveCallee(t.def, t.substs);
+      if (target.kind === "fn") return this.instance(target.def, target.substs);
+    }
+    const key = `ptr:${tyKey(t)}`;
+    const existing = this.instances.get(key);
+    if (existing !== undefined) return existing;
+    const index = this.functions.length;
+    this.functions.push({ name: `{fn pointer shim ${this.tcx.show(t)}}`, params: 0, locals: 0, code: [], lines: [] });
+    this.instances.set(key, index);
+    this.queue.push({ index, kind: "shim", callee: t, argc: this.tcx.callableSig(t)!.params.length });
     return index;
   }
 
   drain() {
     while (this.queue.length) {
       const inst = this.queue.shift()!;
-      const fn = this.tcx.defs[inst.def].node as A.FnItem;
-      const fc = new FnCompiler(this, inst.subst);
-      this.functions[inst.index] = { ...fc.compileFn(fn, inst.def), name: this.functions[inst.index].name };
+      const name = this.functions[inst.index].name;
+      if (inst.kind === "fn") {
+        const fn = this.tcx.defs[inst.def].node as A.FnItem;
+        this.functions[inst.index] = { ...new FnCompiler(this, inst.subst).compileFn(fn, inst.def), name };
+      } else if (inst.kind === "closure") {
+        this.functions[inst.index] = { ...new FnCompiler(this, inst.subst).compileClosure(inst.info), name };
+      } else {
+        this.functions[inst.index] = { ...new FnCompiler(this, new Map()).compileShim(inst.callee, inst.argc), name };
+      }
     }
   }
 
@@ -285,10 +383,12 @@ interface LoopCtx {
   resultSlot?: number;
 }
 
-/** A place as the code generator sees it: a root slot plus projections. */
+type DerefVia = "ref" | "box" | "str" | "slice" | "none";
+
+/** A place as the code generator sees it: a root slot plus projections. A negative slot names a root outside the frame. */
 interface CgPlace {
   slot: number;
-  proj: ({ k: "field"; i: number } | { k: "deref"; via: "ref" | "box" | "str" | "none" } | { k: "index"; slot: number; map: boolean; keyTy?: Ty })[];
+  proj: ({ k: "field"; i: number } | { k: "deref"; via: DerefVia } | { k: "index"; slot: number; map: boolean; keyTy?: Ty })[];
   ty: Ty;
 }
 
@@ -305,6 +405,10 @@ class FnCompiler {
   private readonly subst: Subst;
   private readonly tcx: TyCtxt;
   private readonly r: TypeckResults;
+  /** Set while compiling a closure body: slot 0 holds its captures. */
+  private closure?: ClosureInfo;
+  /** Roots that aren't frame slots. Slot `-1 - i` means `outerRoots[i]`. */
+  private readonly outerRoots: ({ upvar: A.NodeId } | { global: number })[] = [];
 
   constructor(g: ProgramBuilder, subst: Subst) {
     this.g = g;
@@ -366,14 +470,15 @@ class FnCompiler {
   compileFn(fn: A.FnItem, def: DefId): FunctionCode {
     let params = 0;
     if (fn.selfParam) { this.slotOf.set(fn.selfParam.id, this.newSlot()); params++; }
-    const complex: { pat: A.Pattern; slot: number }[] = [];
-    for (const p of fn.params) {
+    const complex: { pat: A.Pattern; slot: number; ty: Ty }[] = [];
+    const sig = this.tcx.fnSig(def).params.slice(fn.selfParam ? 1 : 0);
+    fn.params.forEach((p, i) => {
       const slot = this.newSlot();
       params++;
       if (p.pat.kind === "ident" && !this.tcx.res.patternPaths.has(p.pat.id)) this.slotOf.set(p.pat.id, slot);
-      else complex.push({ pat: p.pat, slot });
-    }
-    for (const c of complex) this.bindPattern(c.pat, { slot: c.slot, proj: [], ty: this.ty(c.pat.id) });
+      else complex.push({ pat: p.pat, slot, ty: this.mono(sig[i]) });
+    });
+    for (const c of complex) this.bindPattern(c.pat, { slot: c.slot, proj: [], ty: c.ty });
     if (!fn.body) throw new Error(`codegen: ${this.tcx.pathOf(def)} has no body`);
     this.setLoc(fn.body.span);
     this.expr(fn.body);
@@ -381,12 +486,101 @@ class FnCompiler {
     return { name: "", params, locals: this.slots, code: this.code, lines: this.lines };
   }
 
+  /** A closure body takes its captures, then its arguments. */
+  compileClosure(info: ClosureInfo): FunctionCode {
+    this.closure = info;
+    this.newSlot(); // captures
+    const complex: { pat: A.Pattern; slot: number; ty: Ty }[] = [];
+    info.node.params.forEach((p, i) => {
+      const slot = this.newSlot();
+      if (p.pat.kind === "ident" && !this.tcx.res.patternPaths.has(p.pat.id)) this.slotOf.set(p.pat.id, slot);
+      else complex.push({ pat: p.pat, slot, ty: this.mono(info.params[i]) });
+    });
+    for (const c of complex) this.bindPattern(c.pat, { slot: c.slot, proj: [], ty: c.ty });
+    this.setLoc(info.node.body.span);
+    this.expr(info.node.body);
+    this.emit(Op.RET);
+    return { name: "", params: info.node.params.length + 1, locals: this.slots, code: this.code, lines: this.lines };
+  }
+
+  compileShim(callee: Ty, argc: number): FunctionCode {
+    this.slots = argc;
+    if (callee.k === "closure") this.emit(Op.MAKE_AGG, 0, 0);
+    for (let i = 0; i < argc; i++) this.emit(Op.LOAD, i);
+    if (callee.k === "closure") this.emit(Op.CALL, this.g.closureInstance(callee), argc + 1);
+    else this.callFnItem(callee as Extract<Ty, { k: "fndef" }>, argc, { file: 0, start: 0, end: 0 });
+    this.emit(Op.RET);
+    this.g.drain();
+    return { name: "", params: argc, locals: this.slots, code: this.code, lines: this.lines };
+  }
+
+  compileInit(value: A.Expr): FunctionCode {
+    this.expr(value);
+    this.emit(Op.RET);
+    return { name: "", params: 0, locals: this.slots, code: this.code, lines: this.lines };
+  }
+
+  /** Initialize every global, then run `main`. */
+  compileStart(main: number): FunctionCode {
+    for (let i = 0; i < this.g.globals.length; i++) {
+      this.emit(Op.GLOBAL_REF, i);
+      this.emit(Op.CALL, this.g.globalInit(i), 0);
+      this.emit(Op.STORE_REF);
+      this.g.drain(); // compiling an initializer can reveal more globals
+    }
+    this.emit(Op.CALL, main, 0);
+    this.emit(Op.RET);
+    return { name: "", params: 0, locals: this.slots, code: this.code, lines: this.lines };
+  }
+
   // -------------------------------------------------------------------------
   // Places
   // -------------------------------------------------------------------------
 
+  private outerRoot(root: { upvar: A.NodeId } | { global: number }): number {
+    let i = this.outerRoots.findIndex((r) => JSON.stringify(r) === JSON.stringify(root));
+    if (i < 0) i = this.outerRoots.push(root) - 1;
+    return -1 - i;
+  }
+
+  /** Rewrite a place rooted at a captured variable to go through the closure's captures. */
+  private realize(p: CgPlace): CgPlace {
+    if (p.slot >= 0) return p;
+    const root = this.outerRoots[-1 - p.slot];
+    if ("global" in root) return p;
+    const caps = this.closure?.captures ?? [];
+    const i = caps.findIndex((c) => c.root === root.upvar && c.proj.length <= p.proj.length &&
+      c.proj.every((x, j) => { const y = p.proj[j]; return x.k === y.k && (x.k !== "field" || x.index === (y as { i: number }).i); }));
+    if (i < 0) {
+      // `r` itself, where the closure captured `*r` by reference: that reference *is* `r`'s value.
+      const whole = caps.findIndex((c) => c.root === root.upvar && c.by && c.proj.length === p.proj.length + 1 && c.proj[p.proj.length].k === "deref" &&
+        p.proj.every((y, j) => { const x = c.proj[j]; return x.k === y.k && (x.k !== "field" || x.index === (y as { i: number }).i); }));
+      if (whole >= 0) return { slot: 0, proj: [{ k: "field", i: whole }], ty: p.ty };
+      throw new Error("codegen: use of a variable the closure did not capture");
+    }
+    const c = caps[i];
+    const proj: CgPlace["proj"] = [{ k: "field", i }];
+    if (c.by) { const t = this.mono(c.ty); proj.push({ k: "deref", via: t.k === "str" || t.k === "slice" ? "none" : "ref" }); }
+    return { slot: 0, proj: [...proj, ...p.proj.slice(c.proj.length)], ty: p.ty };
+  }
+
+  /** The place of a captured variable, as seen from the code creating the closure. */
+  private capturePlace(c: NonNullable<ClosureInfo["captures"]>[number]): CgPlace {
+    const local = this.r.locals.get(c.root)!;
+    const slot = this.slotOf.get(c.root) ?? this.outerRoot({ upvar: c.root });
+    let ty = this.mono(local.ty);
+    const proj: CgPlace["proj"] = [];
+    for (const x of c.proj) {
+      if (x.k === "field") proj.push({ k: "field", i: x.index });
+      else proj.push({ k: "deref", via: this.derefVia(ty) });
+      ty = this.g.normalize(this.tcx.projTy(ty, [x]));
+    }
+    return { slot, proj, ty };
+  }
+
   private isPlaceExpr(e: A.Expr): boolean {
     if (e.kind === "path") {
+      if (this.r.statics.has(e.id)) return true;
       const pr = this.tcx.res.paths.get(e.path.id);
       return pr?.base.kind === "local" && pr.unresolved.length === 0;
     }
@@ -394,16 +588,19 @@ class FnCompiler {
   }
 
   private derefTy(t: Ty): Ty {
-    if (t.k === "ref") return t.inner;
+    if (t.k === "ref" || t.k === "ptr") return t.inner;
     if (t.k === "adt" && (this.tcx.isLang(t.def, "Box"))) return t.args[0];
     if (t.k === "adt" && this.tcx.isLang(t.def, "String")) return { k: "str" };
+    if (t.k === "adt" && this.tcx.isLang(t.def, "Vec")) return { k: "slice", elem: t.args[0] };
+    if (t.k === "array") return { k: "slice", elem: t.elem };
     return ERROR;
   }
 
-  /** How to dereference a value of type `t`. `&str` is the string itself, so its deref is a no-op. */
-  private derefVia(t: Ty): "ref" | "box" | "str" | "none" {
-    if (t.k === "ref") return t.inner.k === "str" ? "none" : "ref";
+  /** How to dereference a value of type `t`. `&str` and `&[T]` are their own referents, so their deref is a no-op. */
+  private derefVia(t: Ty): DerefVia {
+    if (t.k === "ref" || t.k === "ptr") return t.inner.k === "str" || t.inner.k === "slice" ? "none" : "ref";
     if (t.k === "adt" && this.tcx.isLang(t.def, "Box")) return "box";
+    if (t.k === "array" || (t.k === "adt" && this.tcx.isLang(t.def, "Vec"))) return "slice";
     return "str";
   }
 
@@ -424,10 +621,13 @@ class FnCompiler {
   private place(e: A.Expr): CgPlace {
     switch (e.kind) {
       case "path": {
+        const st = this.r.statics.get(e.id);
+        if (st !== undefined) return { slot: this.outerRoot({ global: this.g.globalIndex(st) }), proj: [], ty: this.ty(e.id) };
         const pr = this.tcx.res.paths.get(e.path.id);
         if (pr?.base.kind === "local") {
           const slot = this.slotOf.get(pr.base.id);
           if (slot !== undefined) return { slot, proj: [], ty: this.ty(e.id) };
+          if (this.closure) return { slot: this.outerRoot({ upvar: pr.base.id }), proj: [], ty: this.ty(e.id) };
         }
         break;
       }
@@ -455,6 +655,23 @@ class FnCompiler {
           this.emit(Op.STORE, slot);
           return { slot, proj: [], ty: { k: "str" } };
         }
+        if (this.r.sliceRanges.has(e.id) && e.index.kind === "range") {
+          const range = e.index;
+          const slot = this.newSlot();
+          this.loadPlace(base);
+          if (range.start) this.expr(range.start); else this.emitConst(0);
+          if (range.end) {
+            this.expr(range.end);
+            if (range.inclusive) { this.emitConst(1); this.emit(Op.ADD, this.g.numKind({ k: "int", name: "usize" })); }
+          } else {
+            this.loadPlace(base);
+            this.emit(Op.INTRINSIC, this.g.intrinsic("slice::seq_len"), 1);
+          }
+          this.setLoc(e.span);
+          this.emit(Op.INTRINSIC, this.g.intrinsic("slice::range"), 3);
+          this.emit(Op.STORE, slot);
+          return { slot, proj: [], ty: base.ty };
+        }
         const idx = this.newSlot();
         this.expr(e.index);
         this.emit(Op.STORE, idx);
@@ -476,31 +693,42 @@ class FnCompiler {
   }
 
   /** Push the value stored at a place (no copy). */
-  private loadPlace(p: CgPlace) {
+  private loadPlace(p0: CgPlace) {
+    const p = this.realize(p0);
     if (p.proj.some((x) => x.k === "index" && x.map)) {
       this.refPlace(p);
       this.emit(Op.LOAD_REF);
       return;
     }
-    this.emit(Op.LOAD, p.slot);
+    if (p.slot < 0) { this.emitRoot(p.slot); this.emit(Op.LOAD_REF); }
+    else this.emit(Op.LOAD, p.slot);
     for (const pr of p.proj) {
       if (pr.k === "field") this.emit(Op.GET_FIELD, pr.i);
-      else if (pr.k === "deref") { if (pr.via !== "none") this.emit(pr.via === "box" ? Op.GET_BOX : pr.via === "str" ? Op.STR_OF : Op.LOAD_REF); }
+      else if (pr.k === "deref") { if (pr.via !== "none") this.emit(pr.via === "box" ? Op.GET_BOX : pr.via === "str" ? Op.STR_OF : pr.via === "slice" ? Op.AS_SLICE : Op.LOAD_REF); }
       else { this.emit(Op.LOAD, pr.slot); this.emit(Op.INDEX_GET); }
     }
   }
 
+  /** Push the address of a root outside the frame. */
+  private emitRoot(slot: number) {
+    const root = this.outerRoots[-1 - slot];
+    if (!("global" in root)) throw new Error("codegen: unresolved captured variable");
+    this.emit(Op.GLOBAL_REF, root.global);
+  }
+
   /** Push a reference to a place. */
-  private refPlace(p: CgPlace) {
-    // `&str` is represented by the string itself.
-    if (p.ty.k === "str") {
+  private refPlace(p0: CgPlace) {
+    const p = this.realize(p0);
+    // `&str` is represented by the string itself, and `&[T]` by the slice.
+    if (p.ty.k === "str" || p.ty.k === "slice") {
       this.loadPlace(p);
       return;
     }
-    this.emit(Op.REF_LOCAL, p.slot);
+    if (p.slot < 0) this.emitRoot(p.slot);
+    else this.emit(Op.REF_LOCAL, p.slot);
     for (const pr of p.proj) {
       if (pr.k === "field") this.emit(Op.FIELD_REF, pr.i);
-      else if (pr.k === "deref") { if (pr.via !== "none") this.emit(pr.via === "str" ? Op.STR_REF : Op.DEREF_REF); }
+      else if (pr.k === "deref") { if (pr.via !== "none") this.emit(pr.via === "str" ? Op.STR_REF : pr.via === "slice" ? Op.REF_SLICE : Op.DEREF_REF); }
       else if (pr.map) {
         this.emit(Op.LOAD_REF);
         this.emit(Op.LOAD, pr.slot);
@@ -514,8 +742,9 @@ class FnCompiler {
   }
 
   /** Store the value produced by `value()` into a place. */
-  private storePlace(p: CgPlace, value: () => void) {
-    if (p.proj.length === 0) {
+  private storePlace(p0: CgPlace, value: () => void) {
+    const p = this.realize(p0);
+    if (p.proj.length === 0 && p.slot >= 0) {
       value();
       this.emit(Op.STORE, p.slot);
       return;
@@ -553,7 +782,16 @@ class FnCompiler {
     // Diverging expressions may leave the bookkeeping unbalanced; normalize it.
     this.depth = start + 1;
     const coerce = this.r.coercions.get(e.id);
-    if (coerce) for (const step of coerce) this.emit(step === "ref" ? Op.LOAD_REF : step === "box" ? Op.DEREF_REF : Op.STR_REF);
+    if (coerce) {
+      for (const step of coerce) {
+        if (step === "fnptr") {
+          this.emit(Op.POP);
+          this.emit(Op.FN_PTR, this.g.fnPointer(this.ty(e.id)));
+        } else {
+          this.emit(step === "ref" ? Op.LOAD_REF : step === "box" ? Op.DEREF_REF : step === "vec" || step === "unsize" ? Op.REF_SLICE : Op.STR_REF);
+        }
+      }
+    }
   }
 
   private exprInner(e: A.Expr): void {
@@ -565,8 +803,13 @@ class FnCompiler {
         if (this.isPlaceExpr(e.expr)) this.refPlace(this.adjust(this.place(e.expr), e.expr));
         else {
           const t = this.ty(e.expr.id);
+          if (!e.mutable && !e.raw && isPromotable(e.expr, this.r)) {
+            // It must outlive this frame, so it lives in a global, built once.
+            this.emit(Op.GLOBAL_REF, this.g.promotedIndex(e.expr, this.subst));
+            return;
+          }
           this.expr(e.expr);
-          if (t.k === "str") return; // `&*"literal"`: a str is already its own reference
+          if (t.k === "str" || t.k === "slice") return; // already its own reference
           const slot = this.newSlot();
           this.emit(Op.STORE, slot);
           this.emit(Op.REF_LOCAL, slot);
@@ -577,6 +820,27 @@ class FnCompiler {
       case "assign": return this.assign(e);
       case "call": return this.call(e);
       case "methodCall": return this.methodCall(e);
+      case "array":
+        for (const x of e.elems) this.expr(x);
+        this.emit(Op.INTRINSIC, this.g.intrinsic("vec::from_elems"), e.elems.length);
+        return;
+      case "repeat": {
+        const t = this.ty(e.id);
+        this.expr(e.value);
+        this.emitConst(t.k === "array" && t.len.k === "constval" ? t.len.n : 0);
+        this.emitConst(this.g.typeDesc(this.ty(e.value.id)));
+        this.emit(Op.INTRINSIC, this.g.intrinsic("vec::from_elem"), 3);
+        return;
+      }
+      case "closure": {
+        const caps = this.r.closures.get(e.id)!.captures ?? [];
+        for (const c of caps) {
+          const p = this.capturePlace(c);
+          if (c.by) this.refPlace(p); else this.readPlace(p);
+        }
+        this.emit(Op.MAKE_AGG, 0, caps.length);
+        return;
+      }
       case "field": case "index":
         this.setLoc(e.span);
         this.readPlace(this.adjust(this.place(e), e));
@@ -650,15 +914,22 @@ class FnCompiler {
         this.emit(Op.RET);
         return;
       case "match": return this.match(e);
-      case "range":
-        this.expr(e.start!);
-        this.expr(e.end!);
-        if (e.inclusive) { this.emit(Op.FALSE); this.emit(Op.MAKE_AGG, 0, 3); }
-        else this.emit(Op.MAKE_AGG, 0, 2);
+      case "range": {
+        const bounds = [e.start, e.end].filter((x): x is A.Expr => !!x);
+        for (const b of bounds) this.expr(b);
+        if (e.inclusive && e.start && e.end) { this.emit(Op.FALSE); this.emit(Op.MAKE_AGG, 0, 3); }
+        else this.emit(Op.MAKE_AGG, 0, bounds.length);
         return;
+      }
       case "cast": {
         const from = this.ty(e.expr.id), to = this.ty(e.id);
         this.expr(e.expr);
+        if (to.k === "ptr" || from.k === "ptr" || to.k === "fnptr") {
+          if (from.k === "ref" && from.inner.k === "array" && to.k === "ptr" && to.inner.k !== "array") this.emit(Op.INTRINSIC, this.g.intrinsic("array::as_ptr"), 1);
+          else if (from.k === "ptr" && to.k === "int") this.emit(Op.INTRINSIC, this.g.intrinsic("ptr::addr"), 1);
+          else if (from.k === "int" && to.k === "ptr") this.emit(Op.INTRINSIC, this.g.intrinsic("ptr::from_addr"), 1);
+          return;
+        }
         if (from.k === "adt") {
           this.emit(Op.GET_TAG);
           this.emit(Op.CAST, this.g.numKind({ k: "int", name: "i32" }), this.g.numKind(to));
@@ -710,6 +981,13 @@ class FnCompiler {
       this.emit(Op.MAKE_AGG, d.kind === "variant" ? d.variantIndex! : 0, 0);
       return;
     }
+    const constParam = this.r.constParams.get(e.id);
+    if (constParam) {
+      const v = this.mono(constParam);
+      this.emitConst(v.k === "constval" ? v.n : 0);
+      return;
+    }
+    if (this.ty(e.id).k === "fndef") { this.emit(Op.UNIT); return; } // function items carry no data
     const callee = this.r.callees.get(e.id);
     if (callee && this.tcx.defs[callee.def].kind === "const") {
       this.constValue(callee);
@@ -764,6 +1042,11 @@ class FnCompiler {
       return;
     }
     this.setLoc(e.span);
+    if (this.r.seqEq.has(e.id)) {
+      this.seqEquality(e.left, e.right);
+      if (op === "!=") this.emit(Op.NOT, this.g.numKind({ k: "bool" }));
+      return;
+    }
     const callee = this.r.callees.get(e.id);
     const isCmp = ["==", "!=", "<", "<=", ">", ">="].includes(op);
     if (isCmp && callee) {
@@ -806,6 +1089,21 @@ class FnCompiler {
     this.emit(table[op], k);
   }
 
+  /** Compare two different sequence types (`vec == [1, 2]`) as slices. */
+  private seqEquality(a: A.Expr, b: A.Expr) {
+    let elem: Ty = ERROR;
+    for (const e of [a, b]) {
+      this.expr(e);
+      let t = this.ty(e.id);
+      while (t.k === "ref" && t.inner.k === "ref") { this.emit(Op.LOAD_REF); t = t.inner; }
+      if (t.k === "ref" && t.inner.k !== "slice") { this.emit(Op.REF_SLICE); t = t.inner; }
+      else if (t.k === "ref") t = t.inner;
+      else if (t.k !== "slice") this.emit(Op.AS_SLICE);
+      elem = t.k === "adt" ? t.args[0] : t.k === "array" || t.k === "slice" ? t.elem : ERROR;
+    }
+    this.emit(Op.DEEP_EQ, this.g.typeDesc({ k: "slice", elem }));
+  }
+
   private assign(e: Extract<A.Expr, { kind: "assign" }>) {
     this.setLoc(e.span);
     const callee = this.r.callees.get(e.id);
@@ -815,7 +1113,7 @@ class FnCompiler {
       this.emit(Op.UNIT);
       return;
     }
-    const p = this.place(e.target);
+    const p = this.realize(this.place(e.target));
     if (callee) {
       this.refPlace(p);
       this.expr(e.value);
@@ -824,7 +1122,7 @@ class FnCompiler {
     }
     const opTable: Record<string, number> = { "+=": Op.ADD, "-=": Op.SUB, "*=": Op.MUL, "/=": Op.DIV, "%=": Op.REM, "&=": Op.BITAND, "|=": Op.BITOR, "^=": Op.BITXOR, "<<=": Op.SHL, ">>=": Op.SHR };
     const k = this.g.numKind(p.ty);
-    if (p.proj.length === 0) {
+    if (p.proj.length === 0 && p.slot >= 0) {
       this.emit(Op.LOAD, p.slot);
       this.expr(e.value);
       this.applyNumericDeref(e.value);
@@ -842,7 +1140,35 @@ class FnCompiler {
     this.emit(Op.UNIT);
   }
 
+  /** Call a named function or tuple constructor; its arguments are on the stack. */
+  private callFnItem(t: Extract<Ty, { k: "fndef" }>, argc: number, span: Span) {
+    const d = this.tcx.defs[t.def];
+    if (d.kind === "fn") this.callTarget(this.g.resolveCallee(t.def, t.substs), argc, span);
+    else this.emit(Op.MAKE_AGG, d.kind === "variant" ? d.variantIndex! : 0, argc);
+  }
+
+  /** `f(args)` where `f` is a value. All of this is resolved statically except fn pointers. */
+  private valueCall(e: Extract<A.Expr, { kind: "call" }>) {
+    const base = this.isPlaceExpr(e.callee) ? this.place(e.callee) : this.tempPlace(e.callee);
+    const p = this.adjust(base, e.callee);
+    this.loadPlace(p);
+    let t = p.ty;
+    while (t.k === "ref" || (t.k === "adt" && this.tcx.isLang(t.def, "Box"))) {
+      this.emit(t.k === "ref" ? Op.LOAD_REF : Op.GET_BOX);
+      t = this.derefTy(t);
+    }
+    const argc = e.args.length;
+    if (t.k === "fndef") this.emit(Op.POP);
+    for (const a of e.args) this.expr(a);
+    this.setLoc(e.span);
+    if (t.k === "closure") this.emit(Op.CALL, this.g.closureInstance(t), argc + 1);
+    else if (t.k === "fnptr") this.emit(Op.CALL_PTR, argc);
+    else if (t.k === "fndef") this.callFnItem(t, argc, e.span);
+    else throw new Error(`codegen: cannot call a value of type ${this.tcx.show(t)}`);
+  }
+
   private call(e: Extract<A.Expr, { kind: "call" }>) {
+    if (this.r.valueCalls.has(e.id)) return this.valueCall(e);
     const ctor = this.r.ctors.get(e.id);
     for (const a of e.args) this.expr(a);
     this.setLoc(e.span);
@@ -884,7 +1210,7 @@ class FnCompiler {
     if (t.kind === "intrinsic") {
       // Native code can't inspect values at runtime, so map operations get the
       // key's type descriptor (for hashing and equality) as a trailing argument.
-      if (/^(HashMap|collections)::/.test(t.name) && t.substs?.length) {
+      if ((/^(HashMap|collections)::/.test(t.name) || t.name === "mem::conjure_zst") && t.substs?.length) {
         this.emitConst(this.g.typeDesc(t.substs[0]));
         argc++;
       }
@@ -903,18 +1229,18 @@ class FnCompiler {
         this.emit(Op.CLONE, td);
         return;
       case "eq": case "ne":
-        this.derefTwo();
+        this.derefTwo(t.self);
         this.emit(Op.DEEP_EQ, td);
         if (t.method === "ne") this.emit(Op.NOT, this.g.numKind({ k: "bool" }));
         return;
       case "lt": case "le": case "gt": case "ge":
-        this.derefTwo();
+        this.derefTwo(t.self);
         this.emit(Op.DEEP_CMP, td);
         this.emitConst(0);
         this.emit(({ lt: Op.LT, le: Op.LE, gt: Op.GT, ge: Op.GE } as Record<string, number>)[t.method], this.g.numKind({ k: "int", name: "i32" }));
         return;
       case "partial_cmp": case "cmp":
-        this.derefTwo();
+        this.derefTwo(t.self);
         this.emit(Op.DEEP_CMP, td);
         this.emit(Op.INTRINSIC, this.g.intrinsic(t.method === "cmp" ? "cmp::to_ordering" : "cmp::to_option_ordering"), 1);
         return;
@@ -922,7 +1248,7 @@ class FnCompiler {
         // Stack: [&self, &mut Formatter] → append to the formatter, return Ok(()).
         const f = this.newSlot();
         this.emit(Op.STORE, f);
-        this.emit(Op.LOAD_REF);
+        if (t.self.k !== "str" && t.self.k !== "slice") this.emit(Op.LOAD_REF);
         const v = this.newSlot();
         this.emit(Op.STORE, v);
         this.emit(Op.LOAD, f);
@@ -934,6 +1260,14 @@ class FnCompiler {
         return;
       }
       case "default":
+        if (t.self.k === "array") {
+          // Each element gets its own default value.
+          const n = t.self.len.k === "constval" ? t.self.len.n : 0;
+          const method = this.tcx.traitInfo(this.tcx.lang("Default")).methods.get("default")!;
+          for (let i = 0; i < n; i++) this.callTarget(this.g.resolveCallee(method, [t.self.elem]), 0, { file: 0, start: 0, end: 0 });
+          this.emit(Op.INTRINSIC, this.g.intrinsic("vec::from_elems"), n);
+          return;
+        }
         this.emit(Op.DEFAULT, td);
         return;
     }
@@ -941,7 +1275,8 @@ class FnCompiler {
   }
 
   /** Stack `[&a, &b]` → `[a, b]`. */
-  private derefTwo() {
+  private derefTwo(self: Ty) {
+    if (self.k === "str" || self.k === "slice") return; // `&str` and `&[T]` are the values themselves
     const b = this.newSlot();
     this.emit(Op.STORE, b);
     this.emit(Op.LOAD_REF);
@@ -960,7 +1295,7 @@ class FnCompiler {
       const slot = this.newSlot();
       this.expr(f.value);
       this.emit(Op.STORE, slot);
-      slots.set(this.r.fieldIndices.get(f.value.id)!, slot);
+      slots.set(this.r.litFields.get(f.value.id)!, slot);
     }
     let baseSlot: number | undefined;
     if (e.base) {
@@ -1007,9 +1342,9 @@ class FnCompiler {
     switch (p.kind) {
       case "ident":
         if (!this.tcx.res.patternPaths.has(p.id) && !this.slotOf.has(p.id)) this.slotOf.set(p.id, this.newSlot());
-        if (p.sub) this.declarePattern(p.sub);
+        if (p.sub && p.sub.kind !== "rest") this.declarePattern(p.sub);
         return;
-      case "tuple": case "tupleStruct": p.elems.forEach((x) => this.declarePattern(x)); return;
+      case "tuple": case "tupleStruct": case "slice": p.elems.forEach((x) => this.declarePattern(x)); return;
       case "struct": p.fields.forEach((f) => this.declarePattern(f.pat)); return;
       case "ref": this.declarePattern(p.inner); return;
       case "or": {
@@ -1053,9 +1388,11 @@ class FnCompiler {
         if (mode === "move") this.readPlace(place);
         else this.refPlace(place);
         this.emit(Op.STORE, slot);
-        if (p.sub) this.testPattern(p.sub, place, fails);
+        if (p.sub && p.sub.kind !== "rest") this.testPattern(p.sub, place, fails);
         return;
       }
+      case "rest": return;
+      case "slice": return this.testSlicePattern(p, place, fails);
       case "lit": {
         if (!fails) return;
         this.loadPlace(place);
@@ -1116,6 +1453,57 @@ class FnCompiler {
     }
   }
 
+  private testSlicePattern(p: Extract<A.Pattern, { kind: "slice" }>, place: CgPlace, fails: number[] | undefined) {
+    const usize = this.g.numKind({ k: "int", name: "usize" });
+    const ty = place.ty;
+    const elem = ty.k === "array" || ty.k === "slice" ? ty.elem : ERROR;
+    const at = p.elems.findIndex(isRestPat);
+    const fixed = p.elems.length - (at >= 0 ? 1 : 0);
+    const lenSlot = this.newSlot();
+    this.loadPlace(place);
+    this.emit(Op.INTRINSIC, this.g.intrinsic("slice::seq_len"), 1);
+    this.emit(Op.STORE, lenSlot);
+    if (fails && ty.k === "slice") {
+      this.emit(Op.LOAD, lenSlot);
+      this.emitConst(fixed);
+      this.emit(at >= 0 ? Op.GE : Op.EQ, usize);
+      fails.push(this.jump(Op.JUMP_IF_FALSE));
+    }
+    p.elems.forEach((x, i) => {
+      if (i === at) {
+        if (x.kind !== "ident") return;
+        // `name @ ..`: the elements between the two ends.
+        const t = this.ty(x.id);
+        const mode = this.r.bindingModes.get(x.id) ?? "move";
+        this.loadPlace(place);
+        this.emitConst(at);
+        this.emit(Op.LOAD, lenSlot);
+        this.emitConst(p.elems.length - 1 - at);
+        this.emit(Op.SUB, usize);
+        this.emit(Op.INTRINSIC, this.g.intrinsic("slice::range"), 3);
+        if (t.k === "array") {
+          this.emit(Op.INTRINSIC, this.g.intrinsic("slice::to_array"), 1);
+          if (mode !== "move") {
+            const tmp = this.newSlot();
+            this.emit(Op.STORE, tmp);
+            this.emit(Op.REF_LOCAL, tmp);
+          }
+        }
+        this.emit(Op.STORE, this.slotOf.get(x.id)!);
+        return;
+      }
+      const idx = this.newSlot();
+      if (at < 0 || i < at) this.emitConst(i);
+      else {
+        this.emit(Op.LOAD, lenSlot);
+        this.emitConst(p.elems.length - i);
+        this.emit(Op.SUB, usize);
+      }
+      this.emit(Op.STORE, idx);
+      this.testPattern(x, { slot: place.slot, proj: [...place.proj, { k: "index", slot: idx, map: false }], ty: elem }, fails);
+    });
+  }
+
   private fieldTys(ty: Ty, ctorDef: DefId): Ty[] {
     if (ty.k !== "adt") return [];
     const v = this.tcx.variants(ty.def).find((x) => x.def === ctorDef);
@@ -1153,7 +1541,8 @@ class FnCompiler {
       const refSlot = this.newSlot();
       this.refPlace(p);
       this.emit(Op.STORE, refSlot);
-      place = { slot: refSlot, proj: [{ k: "deref", via: "ref" }], ty: scrutTy };
+      // A `str` or `[T]` place has no address of its own: its "reference" is the value.
+      place = p.ty.k === "str" || p.ty.k === "slice" ? { slot: refSlot, proj: [], ty: scrutTy } : { slot: refSlot, proj: [{ k: "deref", via: "ref" }], ty: scrutTy };
     } else {
       const slot = this.newSlot();
       this.expr(e.scrutinee);
@@ -1283,11 +1672,28 @@ class FnCompiler {
         return;
       }
       case "assert_eq": case "assert_ne": {
-        const ty = this.ty(e.args[0].id);
+        const ty = this.ty(e.args[0].id), tyB = this.ty(e.args[1].id);
         const a = this.newSlot(), b = this.newSlot();
-        this.expr(e.args[0]); this.emit(Op.STORE, a);
-        this.expr(e.args[1]); this.emit(Op.STORE, b);
-        this.emitEquality(ty, a, b);
+        if (this.r.seqEq.has(e.id)) {
+          // Compared as slices; the originals stay in their slots for the panic message.
+          const arg = (x: A.Expr, slot: number): A.Expr => { this.expr(x); this.emit(Op.STORE, slot); return x; };
+          arg(e.args[0], a); arg(e.args[1], b);
+          let elem: Ty = ERROR;
+          for (const [slot, t0] of [[a, ty], [b, tyB]] as [number, Ty][]) {
+            let t = t0;
+            this.emit(Op.LOAD, slot);
+            while (t.k === "ref" && t.inner.k === "ref") { this.emit(Op.LOAD_REF); t = t.inner; }
+            if (t.k === "ref" && t.inner.k !== "slice") { this.emit(Op.REF_SLICE); t = t.inner; }
+            else if (t.k === "ref") t = t.inner;
+            else if (t.k !== "slice") this.emit(Op.AS_SLICE);
+            elem = t.k === "adt" ? t.args[0] : t.k === "array" || t.k === "slice" ? t.elem : ERROR;
+          }
+          this.emit(Op.DEEP_EQ, this.g.typeDesc({ k: "slice", elem }));
+        } else {
+          this.expr(e.args[0]); this.emit(Op.STORE, a);
+          this.expr(e.args[1]); this.emit(Op.STORE, b);
+          this.emitEquality(ty, a, b);
+        }
         const ok = this.jump(e.name === "assert_eq" ? Op.JUMP_IF_TRUE : Op.JUMP_IF_FALSE);
         const msg = this.newString();
         this.appendText(msg, `assertion \`left ${e.name === "assert_eq" ? "==" : "!="} right\` failed`);
@@ -1298,7 +1704,7 @@ class FnCompiler {
         this.appendText(msg, "\n  left: ");
         this.appendFmt(msg, a, ty, 1);
         this.appendText(msg, "\n right: ");
-        this.appendFmt(msg, b, ty, 1);
+        this.appendFmt(msg, b, tyB, 1);
         this.emit(Op.LOAD, msg);
         this.emit(Op.PANIC);
         this.patch(ok);
@@ -1397,7 +1803,7 @@ class FnCompiler {
 function collectIdents(p: A.Pattern, f: (id: A.NodeId, name: string) => void) {
   switch (p.kind) {
     case "ident": f(p.id, p.name); if (p.sub) collectIdents(p.sub, f); return;
-    case "tuple": case "tupleStruct": p.elems.forEach((x) => collectIdents(x, f)); return;
+    case "tuple": case "tupleStruct": case "slice": p.elems.forEach((x) => collectIdents(x, f)); return;
     case "struct": p.fields.forEach((x) => collectIdents(x.pat, f)); return;
     case "ref": collectIdents(p.inner, f); return;
     case "or": p.alts.forEach((x) => collectIdents(x, f)); return;
@@ -1407,7 +1813,8 @@ function collectIdents(p: A.Pattern, f: (id: A.NodeId, name: string) => void) {
 /** How each instruction changes the operand stack depth. */
 function stackEffect(op: number, operands: number[]): number {
   switch (OPS[op].name) {
-    case "CONST": case "UNIT": case "TRUE": case "FALSE": case "DUP": case "LOAD": case "REF_LOCAL": case "NEW_STRING": case "DEFAULT": return 1;
+    case "CONST": case "UNIT": case "TRUE": case "FALSE": case "DUP": case "LOAD": case "REF_LOCAL": case "NEW_STRING": case "DEFAULT": case "FN_PTR": case "GLOBAL_REF": return 1;
+    case "CALL_PTR": return -operands[0];
     case "POP": case "STORE": case "JUMP_IF_FALSE": case "JUMP_IF_TRUE": case "PANIC": case "PRINT": case "RET": return -1;
     case "STORE_REF": case "STR_APPEND": case "FMT": return -2;
     case "INDEX_REF": case "INDEX_GET": case "ADD": case "SUB": case "MUL": case "DIV": case "REM": case "BITAND": case "BITOR": case "BITXOR":

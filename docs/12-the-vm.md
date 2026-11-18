@@ -24,10 +24,13 @@ Rust has a precise memory model: every type has a size, and a `Vec<i32>` is a po
 | `()` | `undefined` |
 | struct, tuple, enum variant | `Agg`: a tag plus an array of fields |
 | `String` | `RString`: a mutable box around a JS string |
-| `Vec<T>` | `RVec` |
+| `Vec<T>`, `[T; N]` | `RVec` |
+| `&[T]`, `&mut [T]` | `RSlice`: an array, a start and a length |
+| closure | `Agg` of its captures |
+| `fn` pointer | the function's index |
 | `Box<T>` | a one-element JS array `[value]` |
 | `HashMap<K, V>` | `RMap` |
-| `&T`, `&mut T` | `Ref`: an array plus an index |
+| `&T`, `&mut T`, `*const T`, `*mut T` | `Ref`: an array plus an index |
 
 Some consequences:
 

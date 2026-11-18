@@ -17,9 +17,11 @@ import type { DefId } from "../resolve/defs.ts";
 import { InferCtxt } from "../typeck/infer.ts";
 import type { TypeckOutput } from "../typeck/index.ts";
 import { TraitSolver } from "../typeck/traits.ts";
+import { containsKind } from "../typeck/types.ts";
 import { BodyChecker } from "./check.ts";
 import { Lowerer } from "./lower.ts";
 import { bodyToString, type Body } from "./mir.ts";
+import { analyzeClosures } from "./captures.ts";
 import { SignatureChecker } from "./signature.ts";
 
 export interface BorrowckOutput {
@@ -37,6 +39,21 @@ export function borrowck(tc: TypeckOutput, diags: Diagnostics): BorrowckOutput {
   sigs.checkAll();
   // Like rustc, signature errors (E0106) stop us before checking bodies.
   if (diags.errors().length > before) return { bodies, mirText: () => "" };
+  // Closures first: how each one captures decides what its creation borrows.
+  analyzeClosures(tcx, results, sigs, diags);
+  if (diags.errors().length > before) return { bodies, mirText: () => "" };
+  for (const info of results.closures.values()) {
+    const d = tcx.defs[info.owner];
+    if (tcx.defs[tcx.res.crateRoots[d.crate]].name === "std") continue;
+    const solver = new TraitSolver(tcx, new InferCtxt(), tcx.predicates(info.owner));
+    const lowerer = new Lowerer(tcx, results, solver, sigs, `${tcx.pathOf(info.owner)}::{closure}`);
+    new BodyChecker(lowerer.lowerClosure(info), diags, {
+      showTy: (t) => tcx.show(t),
+      mayHoldRefs: (t) => lowerer.mayHoldRefs(t),
+      mayHoldClosure: (t) => containsKind(t, ["closure", "param", "proj", "opaque"]),
+      borrowOf: lowerer.borrowOf,
+    }).check();
+  }
   for (const def of results.checkedBodies) {
     const d = tcx.defs[def];
     if (tcx.defs[tcx.res.crateRoots[d.crate]].name === "std") continue;
@@ -47,6 +64,7 @@ export function borrowck(tc: TypeckOutput, diags: Diagnostics): BorrowckOutput {
     new BodyChecker(body, diags, {
       showTy: (t) => tcx.show(t),
       mayHoldRefs: (t) => lowerer.mayHoldRefs(t),
+      mayHoldClosure: (t) => containsKind(t, ["closure", "param", "proj", "opaque"]),
       borrowOf: lowerer.borrowOf,
     }).check();
   }

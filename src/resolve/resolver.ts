@@ -113,6 +113,8 @@ const LANG_PATHS: Record<string, string[]> = {
   Add: ["ops", "Add"], Sub: ["ops", "Sub"], Mul: ["ops", "Mul"], Div: ["ops", "Div"], Rem: ["ops", "Rem"], Neg: ["ops", "Neg"],
   AddAssign: ["ops", "AddAssign"], SubAssign: ["ops", "SubAssign"], MulAssign: ["ops", "MulAssign"],
   From: ["convert", "From"],
+  Fn: ["ops", "Fn"], FnMut: ["ops", "FnMut"], FnOnce: ["ops", "FnOnce"],
+  RangeFrom: ["ops", "RangeFrom"], RangeTo: ["ops", "RangeTo"], RangeToInclusive: ["ops", "RangeToInclusive"], RangeFull: ["ops", "RangeFull"],
 };
 
 /** Derivable traits and where they live. */
@@ -135,6 +137,7 @@ class Resolver {
   private readonly pending: PendingImport[] = [];
   /** Block node id → anonymous module holding that block's items. */
   private readonly blockModules = new Map<A.NodeId, DefId>();
+  private closureDepth = 0;
   private preludeModule?: DefId;
 
   // Body-resolution state.
@@ -229,6 +232,7 @@ class Resolver {
       const id = this.newDef("tyParam", p.name, crate, owner, undefined, false, p.span);
       this.defs[id].paramIndex = i;
       this.defs[id].bounds = p.bounds;
+      this.defs[id].isConstParam = !!p.constTy;
       this.defs[id].module = this.defs[owner].module;
       params.push(id);
     });
@@ -588,6 +592,11 @@ class Resolver {
     for (const p of generics.params) {
       for (const b of p.bounds) this.resolveTraitPath(b);
       if (p.default) this.resolveType(p.default);
+      if (p.constTy) this.resolveType(p.constTy);
+    }
+    for (const w of generics.where ?? []) {
+      this.resolveType(w.ty);
+      w.bounds.forEach((b) => this.resolveTraitPath(b));
     }
   }
 
@@ -662,10 +671,12 @@ class Resolver {
       if (fn.selfParam) paramRib.values.set("self", fn.selfParam.id);
       for (const p of fn.params) this.bindPattern(p.pat, paramRib, seen);
       if (fn.body) {
-        const savedLabels = this.labelStack;
+        const savedLabels = this.labelStack, savedDepth = this.closureDepth;
         this.labelStack = [];
+        this.closureDepth = 0;
         this.resolveBlock(fn.body);
         this.labelStack = savedLabels;
+        this.closureDepth = savedDepth;
       }
     });
   }
@@ -685,6 +696,9 @@ class Resolver {
           if (crossedBoundary) return undefined; // reported by the caller as E0434
           return { kind: "local", id: local };
         }
+        // `const N: usize` is a generic parameter that names a value.
+        const t = rib.types.get(name);
+        if (t?.kind === "def" && this.defs[t.def].isConstParam) return t;
       } else {
         const t = rib.types.get(name);
         if (t) return t;
@@ -782,7 +796,7 @@ class Resolver {
     const where = index === 0 ? "this scope" : `\`${path.segments.slice(0, index).map((s) => s.name).join("::")}\``;
     if (index === 0 && ns === "value" && path.segments.length === 1 && this.isCapturedLocal(seg.name)) {
       this.diags.error("resolve", seg.span, `can't capture dynamic environment in a fn item`, "E0434")
-        .help("use a closure instead (TSRust doesn't support closures yet), or pass the value as a parameter");
+        .help("use a closure instead, or pass the value as a parameter");
       return;
     }
     if (index < path.segments.length - 1 || ns === "type") {
@@ -815,6 +829,12 @@ class Resolver {
       case "tuple": ty.elems.forEach((e) => this.resolveType(e)); break;
       case "qpath": this.resolveType(ty.self); this.resolveTraitPath(ty.trait); break;
       case "infer": case "never": break;
+      case "ptr": this.resolveType(ty.inner); break;
+      case "slice": this.resolveType(ty.elem); break;
+      case "array": this.resolveType(ty.elem); if (ty.len) this.resolveExpr(ty.len); break;
+      case "fnptr": ty.params.forEach((p) => this.resolveType(p)); if (ty.ret) this.resolveType(ty.ret); break;
+      case "implTrait": ty.bounds.forEach((b) => this.resolveTraitPath(b)); break;
+      case "constArg": this.resolveExpr(ty.value); break;
     }
   }
 
@@ -853,8 +873,8 @@ class Resolver {
         if (p.sub) this.bindPattern(p.sub, rib, seen);
         break;
       }
-      case "wild": case "lit": case "range": break;
-      case "tuple": p.elems.forEach((e) => this.bindPattern(e, rib, seen)); break;
+      case "wild": case "lit": case "range": case "rest": break;
+      case "tuple": case "slice": p.elems.forEach((e) => this.bindPattern(e, rib, seen)); break;
       case "ref": this.bindPattern(p.inner, rib, seen); break;
       case "path": this.resolvePath(p.path, "value"); break;
       case "tupleStruct":
@@ -937,6 +957,22 @@ class Resolver {
       case "block":
         this.resolveBlock(e);
         return;
+      case "closure": {
+        const rib: Rib = { values: new Map(), types: new Map() };
+        const seen = new Map<string, Span>();
+        for (const p of e.params) {
+          if (p.ty) this.resolveType(p.ty);
+          this.bindPattern(p.pat, rib, seen);
+        }
+        if (e.ret) this.resolveType(e.ret);
+        const savedLabels = this.labelStack;
+        this.labelStack = [];
+        this.closureDepth++;
+        this.withRibs([rib], () => this.resolveExpr(e.body));
+        this.closureDepth--;
+        this.labelStack = savedLabels;
+        return;
+      }
       case "match":
         this.resolveExpr(e.scrutinee);
         for (const arm of e.arms) {
@@ -1001,7 +1037,8 @@ class Resolver {
     } else {
       const target = this.labelStack[this.labelStack.length - 1];
       if (!target) {
-        this.diags.error("resolve", e.span, `\`${e.kind}\` outside of a loop`, "E0268");
+        if (this.closureDepth > 0) this.diags.error("resolve", e.span, `\`${e.kind}\` inside of a closure`, "E0267");
+        else this.diags.error("resolve", e.span, `\`${e.kind}\` outside of a loop`, "E0268");
         return;
       }
       this.labels.set(e.id, target.id);
@@ -1035,7 +1072,9 @@ function forEachChild(e: A.Expr, f: (c: A.Expr) => void) {
     case "methodCall": f(e.receiver); e.args.forEach(f); return;
     case "index": f(e.expr); f(e.index); return;
     case "structLit": e.fields.forEach((x) => f(x.value)); if (e.base) f(e.base); return;
-    case "tuple": e.elems.forEach(f); return;
+    case "tuple": case "array": e.elems.forEach(f); return;
+    case "repeat": f(e.value); f(e.len); return;
+    case "closure": f(e.body); return;
     case "block":
       for (const s of e.stmts) {
         if (s.kind === "let" && s.init) f(s.init);

@@ -25,8 +25,33 @@ impl str {
     /// Substring by byte range, like `&s[start..end]` in real Rust.
     pub fn slice(&self, start: usize, end: usize) -> &str;
 
+    /// Remove `prefix` if it is there; otherwise return the string unchanged.
+    pub fn trim_prefix(&self, prefix: &str) -> &str {
+        if self.starts_with(prefix) {
+            self.slice(prefix.len(), self.len())
+        } else {
+            self
+        }
+    }
+
+    /// Remove `suffix` if it is there; otherwise return the string unchanged.
+    pub fn trim_suffix(&self, suffix: &str) -> &str {
+        if self.ends_with(suffix) {
+            self.slice(0, self.len() - suffix.len())
+        } else {
+            self
+        }
+    }
+
     pub fn chars(&self) -> Chars {
-        Chars { s: self, pos: 0 }
+        Chars { s: self, pos: 0, end: self.len() }
+    }
+    pub fn as_bytes(&self) -> &[u8];
+    pub fn bytes(&self) -> crate::iter::Copied<crate::slice::Iter<u8>> {
+        self.as_bytes().iter().copied()
+    }
+    pub fn char_indices(&self) -> CharIndices {
+        CharIndices { chars: self.chars() }
     }
     pub fn split_whitespace(&self) -> Split {
         Split { parts: split_whitespace_vec(self), pos: 0 }
@@ -48,17 +73,48 @@ fn split_whitespace_vec(s: &str) -> Vec<&str>;
 fn split_vec<'a>(s: &'a str, separator: &str) -> Vec<&'a str>;
 fn lines_vec(s: &str) -> Vec<&str>;
 fn next_char(s: &str, pos: &mut usize) -> Option<char>;
+fn prev_char(s: &str, pos: &mut usize) -> Option<char>;
 
 /// Iterator over the `char`s of a string.
+#[derive(Clone)]
 pub struct Chars<'a> {
     s: &'a str,
     pos: usize,
+    end: usize,
 }
 
 impl<'a> Iterator for Chars<'a> {
     type Item = char;
     fn next(&mut self) -> Option<char> {
+        if self.pos >= self.end {
+            return None;
+        }
         next_char(self.s, &mut self.pos)
+    }
+}
+
+impl<'a> crate::iter::DoubleEndedIterator for Chars<'a> {
+    fn next_back(&mut self) -> Option<char> {
+        if self.pos >= self.end {
+            return None;
+        }
+        prev_char(self.s, &mut self.end)
+    }
+}
+
+/// Each `char` with its byte offset.
+pub struct CharIndices<'a> {
+    chars: Chars<'a>,
+}
+
+impl<'a> Iterator for CharIndices<'a> {
+    type Item = (usize, char);
+    fn next(&mut self) -> Option<(usize, char)> {
+        let at = self.chars.pos;
+        match self.chars.next() {
+            Some(c) => Some((at, c)),
+            None => None,
+        }
     }
 }
 

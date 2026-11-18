@@ -38,7 +38,7 @@ export class InferCtxt {
   private readonly bindings: (Ty | undefined)[] = [];
   private readonly kinds: VarKind[] = [];
   private readonly undo: { id: number; binding: Ty | undefined; kind: VarKind }[] = [];
-  /** Variables that were unified with `!` (for never-type fallback). */
+  /** Variables that a `!` expression was coerced into (for never-type fallback). */
   private readonly sawNever = new Set<number>();
 
   newVar(kind: VarKind = "general"): Ty {
@@ -118,11 +118,10 @@ export class InferCtxt {
     }
     if (a.k === "var") return this.bindVar(a.id, b);
     if (b.k === "var") return this.bindVar(b.id, a);
-    if (a.k === "never" || b.k === "never") return true;
     if (a.k !== b.k) return false;
     switch (a.k) {
       case "int": case "float": return a.name === (b as typeof a).name;
-      case "bool": case "char": case "str": return true;
+      case "bool": case "char": case "str": case "never": return true;
       case "tuple": {
         const bb = b as typeof a;
         return a.elems.length === bb.elems.length && a.elems.every((e, i) => this.unify(e, bb.elems[i]));
@@ -136,6 +135,32 @@ export class InferCtxt {
         return a.def === bb.def && a.args.length === bb.args.length && a.args.every((e, i) => this.unify(e, bb.args[i]));
       }
       case "param": return a.def === (b as typeof a).def;
+      case "ptr": {
+        const bb = b as typeof a;
+        return a.mutable === bb.mutable && this.unify(a.inner, bb.inner);
+      }
+      case "slice": return this.unify(a.elem, (b as typeof a).elem);
+      case "array": {
+        const bb = b as typeof a;
+        return this.unify(a.elem, bb.elem) && this.unify(a.len, bb.len);
+      }
+      case "constval": return a.n === (b as typeof a).n;
+      case "closure": {
+        const bb = b as typeof a;
+        return a.id === bb.id && a.args.every((e, i) => this.unify(e, bb.args[i]));
+      }
+      case "fndef": {
+        const bb = b as typeof a;
+        return a.def === bb.def && a.substs.length === bb.substs.length && a.substs.every((e, i) => this.unify(e, bb.substs[i]));
+      }
+      case "fnptr": {
+        const bb = b as typeof a;
+        return !a.isUnsafe === !bb.isUnsafe && a.params.length === bb.params.length && a.params.every((e, i) => this.unify(e, bb.params[i])) && this.unify(a.ret, bb.ret);
+      }
+      case "opaque": {
+        const bb = b as typeof a;
+        return a.def === bb.def && a.index === bb.index && a.args.every((e, i) => this.unify(e, bb.args[i]));
+      }
       case "proj": {
         const bb = b as typeof a;
         return a.trait === bb.trait && a.name === bb.name && this.unify(a.self, bb.self) && a.traitArgs.every((e, i) => this.unify(e, bb.traitArgs[i]));
@@ -145,18 +170,21 @@ export class InferCtxt {
   }
 
   private bindVar(id: number, t: Ty): boolean {
-    if (t.k === "never") {
-      // Don't commit to `!`: the variable may still learn a real type from
-      // another branch. Remember it for fallback.
-      this.sawNever.add(id);
-      return true;
-    }
     const kind = this.kinds[id];
     if (kind === "int" && t.k !== "int") return false;
     if (kind === "float" && t.k !== "float") return false;
     if (this.occurs(id, t)) return false;
     this.bind(id, t);
     return true;
+  }
+
+  /**
+   * A `!` expression was coerced into `t`. Don't commit to `!`: the variable
+   * may still learn a real type from another branch. Remember it for fallback.
+   */
+  markDiverging(t: Ty) {
+    t = this.shallow(t);
+    if (t.k === "var") this.sawNever.add(t.id);
   }
 
   /** Is `t` an integral/float inference variable (an unsuffixed literal)? */
@@ -173,8 +201,8 @@ export class InferCtxt {
 
   /**
    * Apply defaults to everything still unknown: integer literals become
-   * `i32`, float literals `f64`, and variables only ever unified with `!`
-   * become `()` ("never type fallback").
+   * `i32`, float literals `f64`, and variables that only ever received a `!`
+   * become `!` ("never type fallback"; it was `()` before Rust 1.100).
    */
   applyDefaults() {
     for (let id = 0; id < this.bindings.length; id++) {
@@ -183,7 +211,10 @@ export class InferCtxt {
       if (root.k !== "var" || root.id !== id) continue;
       if (this.kinds[id] === "int") this.bind(id, { k: "int", name: "i32" });
       else if (this.kinds[id] === "float") this.bind(id, { k: "float", name: "f64" });
-      else if (this.sawNever.has(id)) this.bind(id, { k: "tuple", elems: [] });
+    }
+    for (const id of this.sawNever) {
+      const root = this.shallow({ k: "var", id });
+      if (root.k === "var") this.bind(root.id, { k: "never" });
     }
   }
 }

@@ -46,7 +46,23 @@ export type Ty =
   /** An associated type projection that can't be normalized yet, e.g. `I::Item` inside `fn f<I: Iterator>`. */
   | { k: "proj"; trait: DefId; traitArgs: Ty[]; self: Ty; name: string }
   | { k: "var"; id: number }
-  | { k: "error" };
+  | { k: "error" }
+  /** `*const T` / `*mut T` */
+  | { k: "ptr"; mutable: boolean; inner: Ty }
+  /** `[T]`: only ever used behind a reference or pointer. */
+  | { k: "slice"; elem: Ty }
+  /** `[T; N]`. `len` is a `constval`, a const generic param or an inference variable. */
+  | { k: "array"; elem: Ty; len: Ty }
+  /** A compile-time integer used where a type argument goes. */
+  | { k: "constval"; n: number }
+  /** The unique type of one closure expression, in terms of its function's generics. */
+  | { k: "closure"; id: number; args: Ty[] }
+  /** The zero-sized type of a named function or tuple constructor. */
+  | { k: "fndef"; def: DefId; substs: Ty[] }
+  /** `fn(A) -> B` */
+  | { k: "fnptr"; params: Ty[]; ret: Ty; isUnsafe?: boolean }
+  /** `impl Trait` returned from function `def`. Only the bounds are visible to callers. */
+  | { k: "opaque"; def: DefId; index: number; args: Ty[] };
 
 export const UNIT: Ty = { k: "tuple", elems: [] };
 export const BOOL: Ty = { k: "bool" };
@@ -74,7 +90,7 @@ export function substitute(t: Ty, subst: Subst): Ty {
     case "ref": return { k: "ref", mutable: t.mutable, inner: substitute(t.inner, subst) };
     case "adt": return { k: "adt", def: t.def, args: t.args.map((a) => substitute(a, subst)) };
     case "proj": return { k: "proj", trait: t.trait, traitArgs: t.traitArgs.map((a) => substitute(a, subst)), self: substitute(t.self, subst), name: t.name };
-    default: return t;
+    default: return mapTy(t, (x) => substitute(x, subst));
   }
 }
 
@@ -85,6 +101,13 @@ export function mapTy(t: Ty, f: (t: Ty) => Ty): Ty {
     case "ref": return { k: "ref", mutable: t.mutable, inner: f(t.inner) };
     case "adt": return { k: "adt", def: t.def, args: t.args.map(f) };
     case "proj": return { k: "proj", trait: t.trait, traitArgs: t.traitArgs.map(f), self: f(t.self), name: t.name };
+    case "ptr": return { k: "ptr", mutable: t.mutable, inner: f(t.inner) };
+    case "slice": return { k: "slice", elem: f(t.elem) };
+    case "array": return { k: "array", elem: f(t.elem), len: f(t.len) };
+    case "closure": return { k: "closure", id: t.id, args: t.args.map(f) };
+    case "fndef": return { k: "fndef", def: t.def, substs: t.substs.map(f) };
+    case "fnptr": return { k: "fnptr", params: t.params.map(f), ret: f(t.ret), isUnsafe: t.isUnsafe };
+    case "opaque": return { k: "opaque", def: t.def, index: t.index, args: t.args.map(f) };
     default: return t;
   }
 }
@@ -97,6 +120,13 @@ export function containsKind(t: Ty, kinds: Ty["k"][]): boolean {
     case "ref": return containsKind(t.inner, kinds);
     case "adt": return t.args.some((e) => containsKind(e, kinds));
     case "proj": return containsKind(t.self, kinds) || t.traitArgs.some((e) => containsKind(e, kinds));
+    case "ptr": return containsKind(t.inner, kinds);
+    case "slice": return containsKind(t.elem, kinds);
+    case "array": return containsKind(t.elem, kinds) || containsKind(t.len, kinds);
+    case "closure": return t.args.some((e) => containsKind(e, kinds));
+    case "fndef": return t.substs.some((e) => containsKind(e, kinds));
+    case "fnptr": return containsKind(t.ret, kinds) || t.params.some((e) => containsKind(e, kinds));
+    case "opaque": return t.args.some((e) => containsKind(e, kinds));
     default: return false;
   }
 }
@@ -112,7 +142,7 @@ export function tyEquals(a: Ty, b: Ty): boolean {
     case "param": return a.def === (b as typeof a).def;
     case "proj": { const bb = b as typeof a; return a.trait === bb.trait && a.name === bb.name && tyEquals(a.self, bb.self) && a.traitArgs.every((e, i) => tyEquals(e, bb.traitArgs[i])); }
     case "var": return a.id === (b as typeof a).id;
-    default: return true;
+    default: return tyKey(a) === tyKey(b);
   }
 }
 
@@ -126,6 +156,14 @@ export function tyKey(t: Ty): string {
     case "param": return `P${t.def}`;
     case "proj": return `<${tyKey(t.self)} as #${t.trait}>::${t.name}`;
     case "var": return `?${t.id}`;
+    case "ptr": return `*${t.mutable ? "mut" : "const"} ${tyKey(t.inner)}`;
+    case "slice": return `[${tyKey(t.elem)}]`;
+    case "array": return `[${tyKey(t.elem)};${tyKey(t.len)}]`;
+    case "constval": return `=${t.n}`;
+    case "closure": return `{closure#${t.id}<${t.args.map(tyKey).join(",")}>}`;
+    case "fndef": return `{fn#${t.def}<${t.substs.map(tyKey).join(",")}>}`;
+    case "fnptr": return `${t.isUnsafe ? "unsafe " : ""}fn(${t.params.map(tyKey).join(",")})->${tyKey(t.ret)}`;
+    case "opaque": return `{opaque#${t.def}.${t.index}<${t.args.map(tyKey).join(",")}>}`;
     default: return t.k;
   }
 }
@@ -144,6 +182,14 @@ export function showTy(t: Ty, nameOf: (def: DefId) => string, varName?: (id: num
       case "param": return t.name;
       case "proj": return `<${go(t.self)} as ${nameOf(t.trait)}>::${t.name}`;
       case "var": return varName?.(t.id) ?? "_";
+      case "ptr": return `*${t.mutable ? "mut" : "const"} ${go(t.inner)}`;
+      case "slice": return `[${go(t.elem)}]`;
+      case "array": return `[${go(t.elem)}; ${go(t.len)}]`;
+      case "constval": return String(t.n);
+      case "closure": return "{closure}";
+      case "fndef": return `fn item {${nameOf(t.def)}}`;
+      case "fnptr": return `${t.isUnsafe ? "unsafe " : ""}fn(${t.params.map(go).join(", ")})${isUnit(t.ret) ? "" : ` -> ${go(t.ret)}`}`;
+      case "opaque": return "impl Trait";
     }
   };
   return go(t);

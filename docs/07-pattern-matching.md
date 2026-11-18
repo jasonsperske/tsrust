@@ -162,6 +162,8 @@ The lowering is uniform:
 
 Each type also has a list of all its constructors (`allCtors`). For `bool` that is `false` and `true`. For an enum it is one per variant. For structs, tuples and references it is the single constructor `single`. For `!` it is the empty list. For integers, floats, strings and std's native types (`Vec`, `String`, ...) the answer is `undefined`, meaning "infinitely many". Only a wildcard covers those completely.
 
+Empty types have no constructors to cover. `!`, `enum Void {}`, `(i32, !)` and a struct with a `!` field are all empty, and an enum variant holding one is skipped, so `let Ok(v) = r;` is irrefutable when `r: Result<T, !>`. Behind a reference this shortcut is off: `&Result<T, !>` still needs its `Err` arm. A private field only counts as empty inside the module that can see it.
+
 ### Specialization
 
 The algorithm works on a **matrix**: one row per arm, one column per value still being examined. At first there is one column, the scrutinee. **Specializing** the matrix by a constructor `c` asks: "suppose the value in the first column was built with `c`; what remains to be matched?" Rows that start with `c` keep `c`'s fields as new columns. Rows that start with a wildcard get one wildcard per field. Rows starting with a different constructor are dropped:
@@ -466,7 +468,7 @@ In `Some(1) | Some(2)`, or in `(x, 0) | (0, x)`, each alternative is a separate 
 
   Overlapping ranges are only recognized when one range contains the other entirely (`covers`), so some unreachable range arms go unreported.
 - **Constants and floats are opaque.** A `const` or float pattern never counts towards coverage. rustc looks inside constants of enum and struct types.
-- **No slice, box or rest-in-tuple patterns.** TSRust has no arrays or slices, so `[first, .., last]` doesn't exist, and `(a, ..)` and `Some(..)` aren't parsed. `..` works only in struct patterns.
+- **No box or rest-in-tuple patterns.** `(a, ..)` and `Some(..)` aren't parsed. `..` works in struct and slice patterns.
 - **No `let ... else`.** The parser rejects it with an error.
 - **Naive code generation.** rustc lowers a match to a *decision tree* that tests each discriminant at most once. TSRust tests arms one after another, re-reading the tag in each arm. The result is correct and easy to follow, but slower for large matches.
 - **Binding before guards.** TSRust performs an arm's bindings (including moves) before evaluating its guard. rustc binds by reference while the guard runs and only moves once the guard succeeds. The difference is only visible in programs that move a value in an arm whose guard then fails.

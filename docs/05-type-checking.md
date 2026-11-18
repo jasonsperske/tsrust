@@ -191,7 +191,9 @@ If nothing pins it down by the end of the function, it **defaults** to `i32`. Fl
   }
 ```
 
-The last line is **never-type fallback**. A variable that only ever met `!` (from `return`, `panic!()`, or `break`) becomes `()`.
+The last line is **never-type fallback**. A variable that only ever received a `!` (from `return`, `panic!()`, or `break`) becomes `!`, as it does on every edition since Rust 1.100 (it used to be `()`).
+
+`!` is an ordinary type that you can write anywhere, such as `Result<T, !>` or `Vec<!>`. It only converts to other types at coercion sites: `let x: i32 = return;` is fine, but `Vec<!>` and `Vec<i32>` are different types.
 
 Inference is not left-to-right. A later use can decide an earlier literal's type:
 

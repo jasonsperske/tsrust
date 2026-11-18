@@ -12,6 +12,13 @@ pub fn take<T: Default>(dest: &mut T) -> T {
     replace(dest, T::default())
 }
 
+/// Make the only value of a zero-sized type out of nothing. The caller promises
+/// that the type really may be conjured up this way.
+pub unsafe fn conjure_zst<T>() -> T;
+
+/// Take ownership of a value without running any cleanup.
+pub fn forget<T>(_value: T) {}
+
 /// Take ownership of a value and let it go. The body is empty: ownership
 /// moving *into* this function is the whole point.
 pub fn drop<T>(_value: T) {}

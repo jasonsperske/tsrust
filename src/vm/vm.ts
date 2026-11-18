@@ -23,7 +23,7 @@ import { NUM_KINDS, Op } from "../bytecode/opcodes.ts";
 import { isStdFunction, type FunctionCode, type Program, type TypeDesc } from "../bytecode/program.ts";
 import { Formatter } from "./format.ts";
 import { INT_BITS, buildIntrinsics, intRange, wrapInt } from "./intrinsics.ts";
-import { Agg, Exit, Panic, Ref, RMap, RString, RVec, type Value } from "./values.ts";
+import { Agg, Exit, Panic, Ref, RMap, RSlice, RString, RVec, seqItems, type Value } from "./values.ts";
 
 export interface RunOptions {
   /** Called with each chunk printed to stdout/stderr. */
@@ -66,6 +66,7 @@ class VM {
   private readonly program: Program;
   private readonly opts: RunOptions;
   private readonly types: TypeDesc[];
+  private readonly globals: Value[] = [];
 
   constructor(program: Program, opts: RunOptions) {
     this.program = program;
@@ -208,18 +209,40 @@ class VM {
         }
         case Op.INDEX_REF: {
           const i = stack.pop() as number;
-          const vec = (stack.pop() as Ref).get() as RVec;
-          if (i >= vec.items.length) throw new Panic(`index out of bounds: the len is ${vec.items.length} but the index is ${i}`);
-          stack.push(new Ref(vec.items, i));
+          const seq = (stack.pop() as Ref).get() as RVec | RSlice;
+          const [items, start, len] = seq instanceof RSlice ? [seq.items, seq.start, seq.len] : [seq.items, 0, seq.items.length];
+          if (i >= len) throw new Panic(`index out of bounds: the len is ${len} but the index is ${i}`);
+          stack.push(new Ref(items, start + i));
           break;
         }
         case Op.INDEX_GET: {
           const i = stack.pop() as number;
-          const vec = stack.pop() as RVec;
-          if (i >= vec.items.length) throw new Panic(`index out of bounds: the len is ${vec.items.length} but the index is ${i}`);
-          stack.push(vec.items[i]);
+          const seq = stack.pop() as RVec | RSlice;
+          const [items, start, len] = seq instanceof RSlice ? [seq.items, seq.start, seq.len] : [seq.items, 0, seq.items.length];
+          if (i >= len) throw new Panic(`index out of bounds: the len is ${len} but the index is ${i}`);
+          stack.push(items[start + i]);
           break;
         }
+        case Op.AS_SLICE: {
+          const v = stack.pop() as RVec | RSlice;
+          stack.push(v instanceof RSlice ? v : new RSlice(v.items, 0, v.items.length));
+          break;
+        }
+        case Op.REF_SLICE: {
+          let v = stack.pop();
+          while (v instanceof Ref) v = v.get();
+          const s = v as RVec | RSlice;
+          stack.push(s instanceof RSlice ? s : new RSlice(s.items, 0, s.items.length));
+          break;
+        }
+        case Op.FN_PTR: stack.push(code[frame.ip++]); break;
+        case Op.CALL_PTR: {
+          const argc = code[frame.ip++];
+          const [fn] = stack.splice(stack.length - 1 - argc, 1);
+          this.call(fn as number, argc);
+          break;
+        }
+        case Op.GLOBAL_REF: stack.push(new Ref(this.globals, code[frame.ip++])); break;
 
         case Op.MAKE_AGG: {
           const tag = code[frame.ip++];
@@ -317,7 +340,7 @@ class VM {
           const f = this.intrinsics.get(name);
           if (!f) throw new Panic(`TSRust: missing intrinsic \`${name}\``);
           const args = stack.splice(stack.length - argc, argc);
-          stack.push(f(args, { clone: (v, t) => this.clone(v, t) }));
+          stack.push(f(args, { clone: (v, t) => this.clone(v, t), types: this.types }));
           break;
         }
         case Op.PANIC: {
@@ -389,10 +412,11 @@ class VM {
         if (x.tag !== y.tag) return false;
         return d.variants[x.tag].fields.every((f, i) => this.deepEq(x.f[i], y.f[i], f.ty));
       }
-      case "vec": {
-        const x = (a as RVec).items, y = (b as RVec).items;
+      case "vec": case "slice": {
+        const x = seqItems(a), y = seqItems(b);
         return x.length === y.length && x.every((v, i) => this.deepEq(v, y[i], d.elem));
       }
+      case "ptr": return a === b || (a instanceof Ref && b instanceof Ref && a.base === b.base && a.i === b.i);
       case "unit": return true;
       default: return a === b;
     }
@@ -422,8 +446,8 @@ class VM {
         const fields = d.variants[x.tag].fields;
         return seq(fields.length, (i) => this.deepCmp(x.f[i], y.f[i], fields[i].ty));
       }
-      case "vec": {
-        const x = (a as RVec).items, y = (b as RVec).items;
+      case "vec": case "slice": {
+        const x = seqItems(a), y = seqItems(b);
         const c = seq(Math.min(x.length, y.length), (i) => this.deepCmp(x[i], y[i], d.elem));
         return c !== 0 ? c : prim(x.length, y.length);
       }
@@ -477,6 +501,7 @@ class VM {
 /** Deep copy of a `Copy` aggregate (structs/tuples of Copy fields). */
 function copyValue(v: Value): Value {
   if (v instanceof Agg) return new Agg(v.tag, v.f.map(copyValue));
+  if (v instanceof RVec) return new RVec(v.items.map(copyValue)); // only arrays are ever Copy
   return v;
 }
 

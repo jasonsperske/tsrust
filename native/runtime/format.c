@@ -406,7 +406,7 @@ static void fmt_fields(StringBuf *out, const u32 *t, const V *values, int pretty
 }
 
 /* Is a reference to this type represented by the value itself (i.e. `&str`)? */
-static int ref_is_value(V td) { return rt_type(td)[0] == T_STR; }
+static int ref_is_value(V td) { u32 k = rt_type(td)[0]; return k == T_STR || k == T_SLICE; }
 
 static void fmt_list(StringBuf *out, const char *open, const char *close, const V *items, u64 n, V elem, int pretty, i64 prec, int indent) {
   sb_push_cstr(out, open);
@@ -465,7 +465,8 @@ void fmt_value(StringBuf *out, V v, V td, int debug, int pretty, i64 prec, int i
       sb_push_cstr(out, ")");
       return;
     }
-    case T_VEC: {
+    case T_PTR: sb_push_cstr(out, "0x1000"); return;
+    case T_VEC: case T_SLICE: {
       const Vec *vec = (const Vec *)v;
       fmt_list(out, "[", "]", vec->data, vec->len, t[1], pretty, prec, indent);
       return;

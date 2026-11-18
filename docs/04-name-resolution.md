@@ -293,7 +293,7 @@ error[E0434]: can't capture dynamic environment in a fn item
   |
 4 |         x * factor
   |             ^^^^^^
-  = help: use a closure instead (TSRust doesn't support closures yet), or pass the value as a parameter
+  = help: use a closure instead, or pass the value as a parameter
 ```
 
 Nested items are resolved *after* the rest of their block. The outer ribs are still on the stack at that point, and that is what makes the helpful message possible. Generic parameters of the outer function are hidden in the same way: the copied ribs have their `types` maps cleared.
@@ -471,7 +471,7 @@ A `break` outside any loop is E0268. Labels don't cross function boundaries: `re
 - **No re-export checks.** rustc rejects `pub use` of a private item (E0364/E0365). TSRust only checks that the importing module can see the item.
 - **Simplified prelude.** rustc injects the prelude per edition and treats it as a glob with special shadowing rules. TSRust consults `std::prelude` as a final lexical fallback.
 - **Extern crates.** Dependencies are found by name from any path's first segment (see [03-crates-and-modules.md](03-crates-and-modules.md)). There is no `extern crate` declaration.
-- **No closures.** The only capture-related error is E0434 for nested `fn` items.
+- **Closures use ordinary scopes.** A closure's parameters get a rib, and its body sees the enclosing locals. Which of them it captures is decided after type checking ([16-closures-slices-unsafe.md](16-closures-slices-unsafe.md)).
 
 ## Try it
 

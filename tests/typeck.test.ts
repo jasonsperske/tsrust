@@ -87,3 +87,32 @@ test("regressions: literal ranges, block-local struct fields, shift-assign, Box 
   assert.equal(runOk(main(`struct P { x: i32 } let p = P { x: 4 }; let mut y = 8u32; y >>= 2; y <<= 3; println!("{} {}", p.x, y);`)), "4 16\n");
   assert.equal(runOk("use std::fmt;\nstruct M;\nimpl fmt::Display for M { fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, \"m\") } }\n" + main(`println!("{}", Box::new(M));`)), "m\n");
 });
+
+test("never type: `!` is a real type that only coerces at coercion sites", () => {
+  assert.deepEqual(errorsOf(main(`let x: ! = 5;`)).codes, ["E0308"]);
+  assert.deepEqual(errorsOf(main(`let a: Vec<!> = Vec::<i32>::new();`)).codes, ["E0308"]);
+  assert.deepEqual(errorsOf(main(`let a: Result<i32, !> = Err(5);`)).codes, ["E0308"]);
+  assert.deepEqual(errorsOf("fn f() -> i32 { 1 + return 2 }\nfn main() {}").codes, ["E0277"]);
+  assert.equal(runOk("fn f(c: bool) -> i32 { if c { let mut x = return 1; x = 5; x } else { 2 } }\n" + main(`println!("{} {}", f(true), f(false));`)), "1 2\n");
+});
+
+test("never type: only the traits `!` really implements hold", () => {
+  assert.deepEqual(errorsOf("fn need<T: Default>() {}\n" + main("need::<!>();")).codes, ["E0277"]);
+  assert.equal(runOk("fn need<T: Clone + Ord + std::fmt::Debug>() -> i32 { 1 }\n" + main(`println!("{}", need::<!>());`)), "1\n");
+  assert.deepEqual(errorsOf(main("let c = false; let _x = if c { return } else { Default::default() };")).codes, ["E0277"]);
+});
+
+test("empty types need no patterns, except behind references", () => {
+  assert.equal(runOk("fn f(r: Result<i32, !>) -> i32 { let Ok(v) = r; v }\n" + main(`println!("{}", f(Ok(1)));`)), "1\n");
+  assert.equal(runOk("use std::convert::Infallible;\nfn f(r: Result<i32, Infallible>) -> i32 { match r { Ok(v) => v } }\n" + main(`println!("{}", f(Ok(2)));`)), "2\n");
+  assert.deepEqual(errorsOf("fn f(r: &Result<i32, !>) -> i32 { let Ok(v) = r; *v }\nfn main() {}").codes, ["E0005"]);
+  assert.deepEqual(errorsOf("fn f(r: &!) -> i32 { match r {} }\nfn main() {}").codes, ["E0004"]);
+  assert.deepEqual(errorsOf("fn f(b: Box<!>) -> i32 { match b {} }\nfn main() {}").codes, ["E0004"]);
+  assert.deepEqual(errorsOf("mod m { pub struct P(!); }\nfn f(p: m::P) -> i32 { match p {} }\nfn main() {}").codes, ["E0004"]);
+});
+
+test("Rust 1.100 library additions", () => {
+  assert.equal(runOk(main(`let mut b = true; b.toggle(); println!("{}", b);`)), "false\n");
+  assert.equal(runOk(main(`let s = "a.b"; println!("{} {} {}", s.trim_prefix("a."), s.trim_suffix(".b"), s.trim_prefix("x"));`)), "b a a.b\n");
+  assert.equal(runOk("fn f<T: AsRef<str>>(t: T) -> usize { t.as_ref().len() }\n" + main(`println!("{} {}", f("abc"), f(String::from("hi")));`)), "3 2\n");
+});

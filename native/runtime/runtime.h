@@ -18,7 +18,11 @@
  *   &T, &mut T             the address of the 64-bit slot holding the T
  *   &str                   pointer to a Str        { len, ptr }
  *   String                 pointer to a StringBuf  { len, ptr, cap }
- *   Vec<T>                 pointer to a Vec        { len, data, cap }
+ *   Vec<T>, [T; N]         pointer to a Vec        { len, data, cap }
+ *   &[T], &mut [T]         pointer to a Vec        { len, first element, 0 }
+ *   *const T, *mut T       like &T
+ *   closure                pointer to an Agg of its captures
+ *   fn pointer             the code address
  *   Box<T>                 pointer to one 64-bit cell
  *   struct/tuple/enum      pointer to an Agg       { tag, n, fields[n] }
  *   HashMap<K, V>          pointer to a Map
@@ -81,7 +85,7 @@ typedef struct {
 } Meta;
 
 /* Type descriptor kinds; must match src/native/compile.ts. */
-enum { T_INT, T_FLOAT, T_BOOL, T_CHAR, T_STR, T_STRING, T_UNIT, T_NEVER, T_TUPLE, T_REF, T_BOX, T_VEC, T_MAP, T_STRUCT, T_ENUM, T_OPAQUE };
+enum { T_INT, T_FLOAT, T_BOOL, T_CHAR, T_STR, T_STRING, T_UNIT, T_NEVER, T_TUPLE, T_REF, T_BOX, T_VEC, T_MAP, T_STRUCT, T_ENUM, T_OPAQUE, T_PTR, T_SLICE };
 /* Numeric kinds; must match NUM_KINDS in src/bytecode/opcodes.ts. */
 enum { K_I8, K_I16, K_I32, K_I64, K_I128, K_ISIZE, K_U8, K_U16, K_U32, K_U64, K_U128, K_USIZE, K_F32, K_F64, K_BOOL, K_CHAR, K_STR };
 

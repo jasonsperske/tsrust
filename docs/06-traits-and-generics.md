@@ -483,7 +483,7 @@ There are no vtables and no runtime type information. Every trait call is resolv
 
 - **No coherence checks.** rustc rejects overlapping impls (E0119) and impls of foreign traits for foreign types (the orphan rule, E0117). TSRust checks neither. Overlapping impls just make selection ambiguous.
 - **Traits need not be in scope** for method calls (see [05-type-checking.md](05-type-checking.md)).
-- **No trait objects, `impl Trait`, or closures.** All dispatch is static.
+- **No trait objects.** All trait dispatch is static. Closures and `impl Trait` are covered in [16-closures-slices-unsafe.md](16-closures-slices-unsafe.md).
 - **A single impl doesn't decide an integer variable.** If `u8` is the only type implementing `Describe`, rustc infers `show(5)` as `show::<u8>`. TSRust's `select` returns "ambiguous" whenever the self type is an inference variable, so `{integer}` defaults to `i32` and the call fails with E0277.
 - **Built-in impls for primitives are a table** (`PRIM_TRAITS`), not real `impl` blocks in std. The VM implements them natively.
 - **Derives are not expanded into impls,** and `#[derive(Default)]` is not supported (it reports an error asking for a hand-written impl).

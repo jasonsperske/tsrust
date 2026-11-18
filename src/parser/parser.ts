@@ -153,6 +153,9 @@ class Parser {
     this.expect(">");
   }
 
+  /** While parsing a function's parameters: where `impl Trait` adds its anonymous generic. */
+  private anonGenerics: A.Generics | undefined;
+
   private expectIdent(what = "identifier"): Token {
     if (this.tok.kind === "ident") return this.advance();
     this.fail(`expected ${what}, found ${describe(this.tok)}`);
@@ -251,7 +254,10 @@ class Parser {
       this.advance();
     }
     // Body-less functions are std intrinsics; name resolution rejects them elsewhere.
-    if (this.is("fn")) return this.parseFn(start, isPub, false);
+    if (this.atFnQualifiers()) return this.parseQualifiedFn(start, isPub);
+    if (this.is("unsafe") && this.is("impl", this.peek())) { this.advance(); return this.parseImpl(start, true); }
+    if (this.is("unsafe") && this.is("trait", this.peek())) { this.advance(); return this.parseTrait(start, isPub, true); }
+    if (this.is("static")) return this.parseStatic(start, isPub);
     if (this.is("struct")) return this.parseStruct(start, isPub, derives);
     if (this.is("enum")) return this.parseEnum(start, isPub, derives);
     if (this.is("impl")) return this.parseImpl(start);
@@ -263,6 +269,20 @@ class Parser {
     this.fail(`expected item, found ${describe(this.tok)}`);
   }
 
+  /** At `fn`, `const fn`, `unsafe fn` or `const unsafe fn`? */
+  private atFnQualifiers(): boolean {
+    let n = 0;
+    if (this.is("const")) n++;
+    if (this.is("unsafe", this.peek(n))) n++;
+    return this.is("fn", this.peek(n));
+  }
+
+  private parseQualifiedFn(start: Span, isPub: boolean): A.FnItem {
+    this.eat("const");
+    const isUnsafe = this.eat("unsafe");
+    return this.parseFn(start, isPub, false, isUnsafe);
+  }
+
   private parseGenerics(): A.Generics {
     const generics: A.Generics = { lifetimes: [], params: [] };
     if (!this.eat("<")) return generics;
@@ -271,6 +291,10 @@ class Parser {
         generics.lifetimes.push(String(this.advance().value));
         // Lifetime bounds like `'a: 'b` are accepted and ignored.
         if (this.eat(":")) while (this.tok.kind === "lifetime" || this.is("+")) this.advance();
+      } else if (this.eat("const")) {
+        const name = this.expectIdent("const parameter");
+        this.expect(":");
+        generics.params.push({ name: String(name.value), bounds: [], constTy: this.parseType(), span: name.span });
       } else {
         const name = this.expectIdent("generic parameter");
         const bounds = this.eat(":") ? this.parseBounds() : [];
@@ -284,10 +308,11 @@ class Parser {
   }
 
   /** `Display + Clone + 'a` */
-  private parseBounds(): A.Path[] {
+  private parseBounds(lifetimes?: string[]): A.Path[] {
     const bounds: A.Path[] = [];
     do {
-      if (this.tok.kind === "lifetime") { this.advance(); continue; }
+      if (this.tok.kind === "lifetime") { const l = String(this.advance().value); lifetimes?.push(l); continue; }
+      this.skipForLifetimes();
       // `?Sized` relaxes an implicit bound TSRust doesn't model; skip it.
       if (this.eat("?")) { this.parsePath("type"); continue; }
       bounds.push(this.parsePath("type"));
@@ -295,21 +320,42 @@ class Parser {
     return bounds;
   }
 
+  /** `for<'a>` on a bound. Lifetimes aren't part of TSRust's types, so it has no effect. */
+  private skipForLifetimes() {
+    if (!this.is("for") || !this.is("<", this.peek())) return;
+    this.advance();
+    this.advance();
+    while (!this.is(">") && this.tok.kind !== "eof") this.advance();
+    this.expect(">");
+  }
+
   /** `where T: Display, U: Clone` — merged into the matching generic params. */
   private parseWhere(generics: A.Generics) {
     if (!this.eat("where")) return;
-    while (this.tok.kind === "ident") {
-      const name = this.advance();
-      this.expect(":");
-      const bounds = this.parseBounds();
-      const param = generics.params.find((p) => p.name === name.value);
-      if (param) param.bounds.push(...bounds);
-      else this.diags.error("parse", name.span, `\`where\` clause for unknown type parameter \`${name.value}\``);
+    while (!this.is("{") && !this.is(";") && this.tok.kind !== "eof") {
+      if (this.tok.kind === "lifetime") {
+        // `'a: 'b` is accepted and ignored.
+        this.advance();
+        this.expect(":");
+        this.parseBounds();
+      } else {
+        this.skipForLifetimes();
+        const param = this.tok.kind === "ident" && this.is(":", this.peek()) ? generics.params.find((p) => p.name === this.tok.value) : undefined;
+        if (param) {
+          this.advance();
+          this.advance();
+          param.bounds.push(...this.parseBounds());
+        } else {
+          const ty = this.parseType();
+          this.expect(":");
+          (generics.where ??= []).push({ ty, bounds: this.parseBounds() });
+        }
+      }
       if (!this.eat(",")) break;
     }
   }
 
-  private parseFn(start: Span, isPub: boolean, requireBody: boolean): A.FnItem {
+  private parseFn(start: Span, isPub: boolean, requireBody: boolean, isUnsafe = false): A.FnItem {
     this.expect("fn");
     const name = this.expectIdent("function name");
     const generics = this.parseGenerics();
@@ -338,7 +384,11 @@ class Parser {
       const pStart = this.tok.span;
       const pat = this.parsePattern();
       this.expect(":");
+      // `impl Trait` here is sugar for an anonymous generic parameter.
+      const savedAnon = this.anonGenerics;
+      this.anonGenerics = generics;
       const ty = this.parseType();
+      this.anonGenerics = savedAnon;
       params.push({ id: this.id(), pat, ty, span: this.spanFrom(pStart) });
       if (!this.eat(",")) break;
     }
@@ -351,7 +401,7 @@ class Parser {
     else this.expect(";");
     return {
       kind: "fn", id: this.id(), span: this.spanFrom(start), name: String(name.value), nameSpan: name.span,
-      isPub, generics, selfParam, params, ret, body,
+      isPub, generics, selfParam, params, ret, body, isUnsafe,
     };
   }
 
@@ -414,7 +464,7 @@ class Parser {
     return { kind: "enum", id: this.id(), span: this.spanFrom(start), name: String(name.value), nameSpan: name.span, isPub, generics, variants, derives };
   }
 
-  private parseImpl(start: Span): A.ImplItem {
+  private parseImpl(start: Span, isUnsafe = false): A.ImplItem {
     this.expect("impl");
     const generics = this.is("<") ? this.parseGenerics() : { lifetimes: [], params: [] };
     const first = this.parseType();
@@ -435,6 +485,7 @@ class Parser {
       const iStart = this.tok.span;
       const isPub = this.eat("pub");
       if (this.is("type")) assocTypes.push(this.parseTypeAlias(iStart, isPub));
+      else if (this.atFnQualifiers()) items.push(this.parseQualifiedFn(iStart, isPub));
       else if (this.is("const")) consts.push(this.parseConst(iStart, isPub));
       // Bodies are optional here so the standard library can declare
       // *intrinsics*: functions implemented natively by the VM. Name resolution
@@ -442,10 +493,10 @@ class Parser {
       else items.push(this.parseFn(iStart, isPub, false));
     }
     this.expect("}");
-    return { kind: "impl", id: this.id(), span: this.spanFrom(start), generics, traitPath, selfTy, items, assocTypes, consts };
+    return { kind: "impl", id: this.id(), span: this.spanFrom(start), generics, traitPath, selfTy, items, assocTypes, consts, isUnsafe };
   }
 
-  private parseTrait(start: Span, isPub: boolean): A.TraitItem {
+  private parseTrait(start: Span, isPub: boolean, isUnsafe = false): A.TraitItem {
     this.expect("trait");
     const name = this.expectIdent("trait name");
     const generics = this.parseGenerics();
@@ -457,10 +508,11 @@ class Parser {
     while (!this.is("}") && this.tok.kind !== "eof") {
       this.parseAttributes();
       if (this.is("type")) assocTypes.push(this.parseTypeAlias(this.tok.span, true));
+      else if (this.atFnQualifiers()) items.push(this.parseQualifiedFn(this.tok.span, true));
       else items.push(this.parseFn(this.tok.span, true, false));
     }
     this.expect("}");
-    return { kind: "trait", id: this.id(), span: this.spanFrom(start), name: String(name.value), nameSpan: name.span, isPub, generics, supertraits, items, assocTypes };
+    return { kind: "trait", id: this.id(), span: this.spanFrom(start), name: String(name.value), nameSpan: name.span, isPub, generics, supertraits, items, assocTypes, isUnsafe };
   }
 
   private parseMod(start: Span, isPub: boolean): A.ModItem {
@@ -532,6 +584,18 @@ class Parser {
     return { kind: "const", id: this.id(), span: this.spanFrom(start), name: String(name.value), nameSpan: name.span, isPub, ty, value };
   }
 
+  private parseStatic(start: Span, isPub: boolean): A.ConstItem {
+    this.expect("static");
+    const mutable = this.eat("mut");
+    const name = this.expectIdent("static name");
+    this.expect(":");
+    const ty = this.parseType();
+    this.expect("=");
+    const value = this.parseExpr();
+    this.expect(";");
+    return { kind: "const", id: this.id(), span: this.spanFrom(start), name: String(name.value), nameSpan: name.span, isPub, ty, value, isStatic: true, mutable };
+  }
+
   // -------------------------------------------------------------------------
   // Paths and types
   // -------------------------------------------------------------------------
@@ -551,6 +615,21 @@ class Parser {
       this.advance();
       const seg: A.PathSegment = { name: String(t.value), span: t.span };
       segments.push(seg);
+      if (mode === "type" && this.is("(") && ["Fn", "FnMut", "FnOnce"].includes(seg.name)) {
+        // `Fn(A, B) -> C` is sugar for `Fn<(A, B), Output = C>`.
+        const pStart = this.advance().span;
+        const elems: A.TypeExpr[] = [];
+        while (!this.is(")")) {
+          elems.push(this.parseType());
+          if (!this.eat(",")) break;
+        }
+        this.expect(")");
+        const tuple: A.TypeExpr = { kind: "tuple", id: this.id(), span: this.spanFrom(pStart), elems };
+        const ret: A.TypeExpr = this.eat("->") ? this.parseType() : { kind: "tuple", id: this.id(), span: tuple.span, elems: [] };
+        seg.generics = [tuple];
+        seg.bindings = [{ name: "Output", ty: ret, span: ret.span }];
+        break;
+      }
       if (mode === "type" && this.is("<")) {
         const { args, bindings, lifetimes } = this.parseGenericArgsWithBindings();
         seg.generics = args;
@@ -591,6 +670,11 @@ class Parser {
         this.advance();
         const ty = this.parseType();
         bindings.push({ name: String(name.value), ty, span: this.spanFrom(name.span) });
+      }
+      else if (this.tok.kind === "int" || this.is("-") || this.is("{")) {
+        const start = this.tok.span;
+        const value = this.is("{") ? this.parseBlock() : this.parseUnary(true);
+        args.push({ kind: "constArg", id: this.id(), span: this.spanFrom(start), value });
       }
       else args.push(this.parseType());
       if (!this.eat(",")) break;
@@ -645,10 +729,47 @@ class Parser {
       const name = String(this.expectIdent("associated type name").value);
       return { kind: "qpath", id: this.id(), span: this.spanFrom(start), self, trait, name };
     }
-    if (this.is("[")) this.fail("arrays and slices are not supported by TSRust yet; use `Vec<T>`");
-    if (this.is("fn") || this.is("impl") || (this.tok.kind === "ident" && this.tok.value === "dyn")) {
-      this.fail(`\`${this.tok.value}\` types are not supported by TSRust yet`);
+    if (this.eat("[")) {
+      const elem = this.parseType();
+      if (this.eat("]")) return { kind: "slice", id: this.id(), span: this.spanFrom(start), elem };
+      this.expect(";");
+      let len: A.Expr | undefined;
+      if (this.tok.kind === "ident" && this.tok.value === "_") this.advance();
+      else len = this.parseExpr();
+      this.expect("]");
+      return { kind: "array", id: this.id(), span: this.spanFrom(start), elem, len };
     }
+    if (this.is("*") && (this.is("const", this.peek()) || this.is("mut", this.peek()))) {
+      this.advance();
+      const mutable = this.advance().value === "mut";
+      return { kind: "ptr", id: this.id(), span: this.spanFrom(start), mutable, inner: this.parseType() };
+    }
+    if (this.is("fn") || (this.is("unsafe") && this.is("fn", this.peek()))) {
+      const isUnsafe = this.eat("unsafe");
+      this.expect("fn");
+      this.expect("(");
+      const params: A.TypeExpr[] = [];
+      while (!this.is(")")) {
+        // Parameter names are allowed and ignored: `fn(x: i32)`.
+        if (this.tok.kind === "ident" && this.is(":", this.peek())) { this.advance(); this.advance(); }
+        params.push(this.parseType());
+        if (!this.eat(",")) break;
+      }
+      this.expect(")");
+      const ret = this.eat("->") ? this.parseType() : undefined;
+      return { kind: "fnptr", id: this.id(), span: this.spanFrom(start), params, ret, isUnsafe };
+    }
+    if (this.eat("impl")) {
+      const lifetimes: string[] = [];
+      const bounds = this.parseBounds(lifetimes);
+      const span = this.spanFrom(start);
+      if (!this.anonGenerics) return { kind: "implTrait", id: this.id(), span, bounds, lifetimes };
+      const name = `impl#${this.anonGenerics.params.length}`;
+      this.anonGenerics.params.push({ name, bounds, span });
+      const path: A.Path = { id: this.id(), span, segments: [{ name, span }] };
+      return { kind: "path", id: this.id(), span, path };
+    }
+    if (this.tok.kind === "ident" && this.tok.value === "dyn") this.fail("`dyn` types are not supported by TSRust yet");
     const path = this.parsePath("type");
     return { kind: "path", id: this.id(), span: path.span, path };
   }
@@ -706,6 +827,16 @@ class Parser {
       this.expect(")");
       return { kind: "tuple", id: this.id(), span: this.spanFrom(start), elems };
     }
+    if (this.eat("[")) {
+      const elems: A.Pattern[] = [];
+      while (!this.is("]")) {
+        elems.push(this.parsePattern());
+        if (!this.eat(",")) break;
+      }
+      this.expect("]");
+      return { kind: "slice", id: this.id(), span: this.spanFrom(start), elems };
+    }
+    if (this.eat("..")) return { kind: "rest", id: this.id(), span: this.spanFrom(start) };
     // Literal patterns, optionally negative, optionally the start of a range.
     const negative = this.is("-") && (this.peek().kind === "int" || this.peek().kind === "float");
     if (negative) this.advance();
@@ -821,8 +952,9 @@ class Parser {
 
   private isItemStart(): boolean {
     if (this.is("#")) return true;
-    if (["fn", "struct", "enum", "impl", "trait", "mod", "use", "pub", "type"].some((k) => this.is(k))) return true;
-    return this.is("const") && this.peek().kind === "ident";
+    if (["fn", "struct", "enum", "impl", "trait", "mod", "use", "pub", "type", "static"].some((k) => this.is(k))) return true;
+    if (this.is("unsafe")) return !this.is("{", this.peek());
+    return this.is("const") && (this.peek().kind === "ident" || this.is("fn", this.peek()) || this.is("unsafe", this.peek()));
   }
 
   parseStmt(): A.Stmt {
@@ -853,6 +985,7 @@ class Parser {
   /** At statement start, a block-like expression is complete on its own (`if a {} -1` is two statements). */
   private parseExprStmt(): A.Expr {
     if (this.is("{") || this.is("if") || this.is("match") || this.is("loop") || this.is("while") || this.is("for") ||
+        (this.is("unsafe") && this.is("{", this.peek())) ||
         (this.tok.kind === "lifetime" && this.is(":", this.peek()))) {
       let e = this.parsePrimary(false);
       // ...but method calls may still be chained: `match x { .. }.unwrap()`.
@@ -887,7 +1020,7 @@ class Parser {
   private canStartExpr(noStruct: boolean): boolean {
     const t = this.tok;
     if (t.kind === "eof") return false;
-    if (t.kind === "punct") return ["(", "-", "!", "*", "&", "&&", "|"].includes(String(t.value)) || (t.value === "{" && !noStruct) || t.value === "..";
+    if (t.kind === "punct") return ["(", "[", "-", "!", "*", "&", "&&", "|", "||"].includes(String(t.value)) || (t.value === "{" && !noStruct) || t.value === "..";
     if (t.kind === "keyword") return !["as", "else", "in"].includes(String(t.value));
     return true;
   }
@@ -959,16 +1092,46 @@ class Parser {
     if (this.is("&") || this.is("&&")) {
       const double = this.is("&&");
       this.advance();
+      if (this.tok.kind === "ident" && this.tok.value === "raw" && (this.is("const", this.peek()) || this.is("mut", this.peek()))) {
+        this.advance();
+        const mutable = this.advance().value === "mut";
+        const expr = this.parseUnary(noStruct);
+        const raw: A.Expr = { kind: "ref", id: this.id(), span: this.spanFrom(start), mutable, expr, raw: true };
+        return double ? { kind: "ref", id: this.id(), span: this.spanFrom(start), mutable: false, expr: raw } : raw;
+      }
       const mutable = this.eat("mut");
       const expr = this.parseUnary(noStruct);
       const inner: A.Expr = { kind: "ref", id: this.id(), span: this.spanFrom(start), mutable, expr };
       if (!double) return inner;
       return { kind: "ref", id: this.id(), span: this.spanFrom(start), mutable: false, expr: inner };
     }
-    if (this.is("|") || this.is("||") || this.is("move")) {
-      this.fail("closures are not supported by TSRust yet");
-    }
+    if (this.is("|") || this.is("||") || this.is("move")) return this.parseClosure(noStruct);
     return this.parsePostfixOps(this.parsePrimary(noStruct), noStruct);
+  }
+
+  private parseClosure(noStruct: boolean): A.Expr {
+    const start = this.tok.span;
+    const isMove = this.eat("move");
+    const params: A.ClosureParam[] = [];
+    if (!this.eat("||")) {
+      this.expect("|");
+      while (!this.is("|")) {
+        const pat = this.parsePatternAtom();
+        const ty = this.eat(":") ? this.parseType() : undefined;
+        params.push({ pat, ty });
+        if (!this.eat(",")) break;
+      }
+      this.expect("|");
+    }
+    let ret: A.TypeExpr | undefined;
+    let body: A.Expr;
+    if (this.eat("->")) {
+      ret = this.parseType();
+      body = this.parseBlock(); // with a return type, the body must be a block
+    } else {
+      body = this.parseExpr(noStruct);
+    }
+    return { kind: "closure", id: this.id(), span: this.spanFrom(start), params, ret, body, isMove };
   }
 
   private parseCallArgs(): A.Expr[] {
@@ -1065,6 +1228,29 @@ class Parser {
       return { kind: "tuple", id: this.id(), span: this.spanFrom(start), elems };
     }
     if (this.is("{")) return this.parseBlock();
+    if (this.is("unsafe") && this.is("{", this.peek())) {
+      this.advance();
+      const b = this.parseBlock();
+      b.isUnsafe = true;
+      b.span = this.spanFrom(start);
+      return b;
+    }
+    if (this.eat("[")) {
+      if (this.eat("]")) return { kind: "array", id: this.id(), span: this.spanFrom(start), elems: [] };
+      const first = this.parseExpr();
+      if (this.eat(";")) {
+        const len = this.parseExpr();
+        this.expect("]");
+        return { kind: "repeat", id: this.id(), span: this.spanFrom(start), value: first, len };
+      }
+      const elems = [first];
+      while (this.eat(",")) {
+        if (this.is("]")) break;
+        elems.push(this.parseExpr());
+      }
+      this.expect("]");
+      return { kind: "array", id: this.id(), span: this.spanFrom(start), elems };
+    }
     if (this.is("if")) return this.parseIf();
     if (this.eat("match")) {
       const scrutinee = this.parseExpr(true);

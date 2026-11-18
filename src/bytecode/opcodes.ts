@@ -97,6 +97,12 @@ const table = {
   STR_APPEND: { operands: [], doc: "pop &str and String; append (String stays referenced elsewhere)" },
   FMT: { operands: ["type", "flags", "precision"], doc: "pop value and String; append the value formatted with Display (flags&1 = Debug, flags&2 = pretty)" },
   PRINT: { operands: ["flags"], doc: "pop a String and print it (flags&1 = newline, flags&2 = stderr)" },
+
+  AS_SLICE: { operands: [], doc: "pop a Vec or array, push a slice of all of it" },
+  REF_SLICE: { operands: [], doc: "pop &Vec or &[T; N], push a slice of all of it" },
+  FN_PTR: { operands: ["fn"], doc: "push a pointer to a bytecode function" },
+  CALL_PTR: { operands: ["argc"], doc: "call through the fn pointer stored below the arguments" },
+  GLOBAL_REF: { operands: ["global"], doc: "push a reference to a `static`" },
 } as const;
 
 export type OpName = keyof typeof table;

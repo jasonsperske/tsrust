@@ -10,10 +10,32 @@
  * a {@link Ref} (or, for `&str`, the string itself), and `self` by value
  * arrives as the value.
  */
-import { Agg, Exit, NONE, Panic, Ref, RMap, RString, RVec, byteToIndex, indexToByte, keyOf, some, utf8Len, type Value } from "./values.ts";
+import type { TypeDesc } from "../bytecode/program.ts";
+import { Agg, Exit, NONE, Panic, Ref, RMap, RSlice, RString, RVec, byteToIndex, indexToByte, keyOf, seqItems, some, utf8Len, type Value } from "./values.ts";
 
 export interface IntrinsicContext {
   clone(v: Value, ty: number): Value;
+  types: TypeDesc[];
+}
+
+const NULL_BASE: Value[] = [];
+/** Numbers handed out for `ptr as usize`, so they can be turned back into pointers. */
+const addrIds = new Map<Value[], number>();
+const addrBases: Value[][] = [];
+function seqParts(v: Value): [Value[], number, number] {
+  return v instanceof RSlice ? [v.items, v.start, v.len] : [(v as RVec).items, 0, (v as RVec).items.length];
+}
+
+/** Build the only value of a zero-sized type. */
+function zst(t: number, types: TypeDesc[], name = ""): Value {
+  const d = types[t];
+  switch (d.k) {
+    case "unit": return undefined;
+    case "tuple": return new Agg(0, d.elems.map((e) => zst(e, types)));
+    case "struct": return new Agg(0, d.fields.map((f) => zst(f.ty, types)));
+    case "vec": return new RVec([]);
+    default: return panic(`mem::conjure_zst invoked on a non-zero-sized type${name}`);
+  }
 }
 
 type Intrinsic = (args: Value[], ctx: IntrinsicContext) => Value;
@@ -269,8 +291,60 @@ export function buildIntrinsics(): Map<string, Intrinsic> {
       return new RVec(items);
     },
 
+    // --- slices and arrays ---
+    "slice::len": ([s]) => (s as RSlice).len,
+    "slice::seq_len": ([s]) => seqParts(s)[2],
+    "slice::range": ([s, a, b]) => {
+      const [items, start, len] = seqParts(s);
+      const lo = a as number, hi = b as number;
+      if (lo > hi) panic(hi === len ? `range start index ${lo} out of range for slice of length ${len}` : `slice index starts at ${lo} but ends at ${hi}`);
+      if (hi > len) panic(`range end index ${hi} out of range for slice of length ${len}`);
+      return new RSlice(items, start + lo, hi - lo);
+    },
+    "slice::to_array": ([s]) => new RVec(seqItems(s)),
+    "slice::swap": ([s, a, b]) => {
+      const x = s as RSlice;
+      for (const i of [a, b]) if ((i as number) >= x.len) panic(`index out of bounds: the len is ${x.len} but the index is ${i}`);
+      const p = x.start + (a as number), q = x.start + (b as number);
+      [x.items[p], x.items[q]] = [x.items[q], x.items[p]];
+      return undefined;
+    },
+    "slice::as_ptr": ([s]) => new Ref((s as RSlice).items, (s as RSlice).start),
+    "slice::as_mut_ptr": ([s]) => new Ref((s as RSlice).items, (s as RSlice).start),
+    "slice::from_raw_parts": ([p, n]) => new RSlice((p as Ref).base, (p as Ref).i, n as number),
+    "slice::from_raw_parts_mut": ([p, n]) => new RSlice((p as Ref).base, (p as Ref).i, n as number),
+    "array::into_vec": ([a]) => a,
+    "array::from_vec": ([v]) => v,
+    "array::as_ptr": ([a]) => new Ref((deref(a) as RVec).items, 0),
+
+    // --- raw pointers ---
+    "ptr::null": () => new Ref(NULL_BASE, 0),
+    "ptr::null_mut": () => new Ref(NULL_BASE, 0),
+    "ptr::is_null": ([p]) => p instanceof Ref && p.base === NULL_BASE,
+    "ptr::offset": ([p, n]) => new Ref((p as Ref).base, (p as Ref).i + (n as number)),
+    "ptr::read": ([p]) => {
+      if (p instanceof Ref && p.base === NULL_BASE) panic("null pointer dereference occurred");
+      return deref(p);
+    },
+    "ptr::write": ([p, v]) => { (p as Ref).set(v); return undefined; },
+    "ptr::addr": ([p]) => {
+      if (!(p instanceof Ref) || p.base === NULL_BASE) return 0;
+      let id = addrIds.get(p.base);
+      if (id === undefined) { id = addrBases.push(p.base); addrIds.set(p.base, id); }
+      return id * 2 ** 24 + p.i * 8;
+    },
+    "ptr::from_addr": ([n]) => {
+      const a = n as number;
+      if (a === 0) return new Ref(NULL_BASE, 0);
+      const base = addrBases[Math.floor(a / 2 ** 24) - 1];
+      return base ? new Ref(base, (a % 2 ** 24) / 8) : panic("TSRust can't turn this integer into a pointer");
+    },
+    "mem::conjure_zst": ([t], ctx) => zst(t as number, ctx.types),
+
     // --- Box ---
     "Box::new": ([v]) => [v],
+    "Box::into_raw": ([b]) => new Ref(b as Value[], 0),
+    "Box::from_raw": ([p]) => (p as Ref).base,
 
     // --- String ---
     "String::new": () => new RString(""),
@@ -344,6 +418,20 @@ export function buildIntrinsics(): Map<string, Intrinsic> {
       const c = String.fromCodePoint(text.codePointAt(idx)!);
       p.set((p.get() as number) + utf8Len(c));
       return some(c);
+    },
+
+    "str::prev_char": ([s, pos]) => {
+      const text = str(s);
+      const p = pos as Ref;
+      const end = byteToIndex(text, p.get() as number);
+      if (end <= 0) return NONE();
+      const c = [...text.slice(0, end)].pop()!;
+      p.set((p.get() as number) - utf8Len(c));
+      return some(c);
+    },
+    "str::as_bytes": ([s]) => {
+      const bytes = [...new TextEncoder().encode(str(s))] as Value[];
+      return new RSlice(bytes, 0, bytes.length);
     },
 
     // --- fmt ---

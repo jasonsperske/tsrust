@@ -558,7 +558,7 @@ The VM ignores this extra information. It all went into format version 2 of the 
 
 - **No intermediate representation for codegen.** rustc lowers to MIR, optimizes it, and hands it to LLVM. TSRust emits bytecode straight from the typed AST, with no optimizer. Redundant `STORE`/`LOAD` pairs and dead code after `break` are visible in every dump. (TSRust does build a MIR, but only for the borrow checker.)
 - **Derives are not code.** rustc expands `#[derive(PartialEq)]` into a real `impl` that calls `PartialEq` on each field. TSRust emits one structural `DEEP_EQ`. One consequence: if a field's type has a *hand-written* `Debug` or `PartialEq`, a derived impl on the outer type ignores it ([14-differences-from-rust.md](14-differences-from-rust.md)).
-- **No vtables or function pointers.** Everything is statically dispatched.
+- **No vtables.** Everything is statically dispatched, except calls through `fn` pointers (`CALL_PTR`).
 - **Memory layout.** rustc computes sizes and alignments, and a move is a `memcpy`. TSRust boxes every aggregate, so a move copies a pointer and `Copy` needs an explicit `COPY`.
 - **Panic locations** imitate `#[track_caller]` without implementing it. rustc marks individual functions such as `unwrap()` with the attribute, and their panics report the caller's location. TSRust instead treats *every* standard-library function that way, and records method-call locations at the method name.
 

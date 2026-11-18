@@ -64,6 +64,7 @@ type Holds = Map<Local, Set<number>>;
 export interface BorrowckHelpers {
   showTy: (t: Ty) => string;
   mayHoldRefs: (t: Ty) => boolean;
+  mayHoldClosure: (t: Ty) => boolean;
   borrowOf: Map<Local, Place>;
 }
 
@@ -96,6 +97,12 @@ export class BodyChecker {
     this.reachable = order.sort((a, b) => a - b);
   }
 
+  /** Outer variables and statics already hold a value when the body starts. */
+  private startsInit(i: number): boolean {
+    const k = this.body.locals[i].kind;
+    return k === "upvar" || k === "static";
+  }
+
   private succs(b: number): number[] {
     const t = this.body.blocks[b].term;
     if (t.k === "goto") return [t.target];
@@ -111,8 +118,8 @@ export class BodyChecker {
     const initIn = this.forward<InitState>(
       () => ({
         moved: new Map(),
-        uninit: new Set(this.body.locals.map((_, i) => String(i)).filter((_, i) => i === 0 || i > this.body.argCount)),
-        init: new Set(this.body.locals.map((_, i) => String(i)).filter((_, i) => i > 0 && i <= this.body.argCount)),
+        uninit: new Set(this.body.locals.map((_, i) => String(i)).filter((_, i) => i === 0 || (i > this.body.argCount && !this.startsInit(i)))),
+        init: new Set(this.body.locals.map((_, i) => String(i)).filter((_, i) => (i > 0 && i <= this.body.argCount) || this.startsInit(i))),
       }),
       () => ({ moved: new Map(), uninit: new Set(), init: new Set() }),
       (a, b) => {
@@ -274,7 +281,11 @@ export class BodyChecker {
             const borrowed = this.h.borrowOf.get(op.place.local);
             if (borrowed) src = borrowed.local;
           }
-          for (const l of st.get(src) ?? []) out.add(l);
+          for (const l of st.get(src) ?? []) {
+            // What a closure borrows stays with the closure, unless the result could contain it.
+            if (this.body.loans[l].capture && rv.name !== "closure" && !this.h.mayHoldClosure(destTy)) continue;
+            out.add(l);
+          }
         });
         return out;
       }
@@ -378,7 +389,9 @@ export class BodyChecker {
     for (const a of this.accesses(s)) {
       if (a.kind !== "write") this.checkInit(a, init);
       if (a.kind === "move") this.checkMoveOut(a);
-      if ((a.kind === "borrow" && a.mutable) || a.kind === "write") this.checkMutability(a, init);
+      // A capture's mutation is reported where the closure body performs it.
+      const isCapture = a.kind === "borrow" && this.body.loans[a.loan].capture;
+      if (((a.kind === "borrow" && a.mutable) || a.kind === "write") && !isCapture) this.checkMutability(a, init);
       this.checkConflicts(a, active, at);
     }
   }
@@ -430,7 +443,20 @@ export class BodyChecker {
   private checkMoveOut(a: Access) {
     const throughRef = a.place.proj.findIndex((p) => p.k === "deref" && p.via !== "box");
     const throughIndex = a.place.proj.some((p) => p.k === "index");
+    const decl = this.body.locals[a.place.local];
+    if (decl.kind === "static") {
+      this.report(`E0507:${a.span.start}`, () => this.diags.error("borrowck", a.span, `cannot move out of static item \`${decl.name}\``, "E0507"));
+      return;
+    }
     if (throughRef < 0 && !throughIndex) return;
+    const last = a.place.proj[a.place.proj.length - 1];
+    if (last?.k === "index" && last.seq) {
+      this.report(`E0508:${a.span.start}`, () => {
+        this.diags.error("borrowck", a.span, `cannot move out of type \`${this.h.showTy(decl.ty)}\`, a non-copy array or slice`, "E0508")
+          .help("borrow the element (`&`) or clone it");
+      });
+      return;
+    }
     this.report(`E0507:${a.span.start}`, () => {
       const name = this.placeName(a.place);
       const via = throughRef >= 0 ? (a.place.proj[throughRef] as { via: string }).via : "";
@@ -447,8 +473,10 @@ export class BodyChecker {
   private checkMutability(a: Access, init: InitState) {
     const decl = this.body.locals[a.place.local];
     const isBorrow = a.kind === "borrow";
-    const sharedDeref = a.place.proj.some((p) => p.k === "deref" && p.via === "ref");
-    const mutDeref = a.place.proj.some((p) => p.k === "deref" && p.via === "refMut");
+    // Only the last pointer on the path decides: `*(*r)` through a `*mut` is writable.
+    const lastDeref = [...a.place.proj].reverse().find((p) => p.k === "deref" && p.via !== "box") as { via: string } | undefined;
+    const sharedDeref = lastDeref?.via === "raw" || a.place.proj.some((p) => p.k === "deref" && p.via === "ref") && lastDeref?.via !== "rawMut";
+    const mutDeref = lastDeref?.via === "refMut" || lastDeref?.via === "rawMut";
     const name = this.placeName(a.place);
     if (sharedDeref) {
       this.report(`mut:${a.span.start}`, () => {
@@ -463,7 +491,7 @@ export class BodyChecker {
       return;
     }
     if (mutDeref || decl.mutable || decl.kind === "temp" || decl.kind === "return") return;
-    if (!isBorrow && a.place.proj.length === 0) {
+    if (!isBorrow && a.place.proj.length === 0 && decl.kind !== "upvar" && decl.kind !== "static") {
       // Assigning a whole immutable local is fine exactly once (deferred initialization).
       // Only fine if it is *definitely* uninitialized here (not, say, assigned in an earlier loop iteration).
       if (!init.init.has(String(a.place.local))) return;
@@ -494,6 +522,8 @@ export class BodyChecker {
       const x = a.proj[i], y = b.proj[i];
       if (x.k !== y.k) return true; // be conservative
       if (x.k === "field" && y.k === "field" && (x.index !== y.index || x.variant !== y.variant)) return false;
+      // Raw pointers aren't tracked: nothing is known about what they alias.
+      if (x.k === "deref" && (x.via === "raw" || x.via === "rawMut")) return false;
     }
     return true;
   }
@@ -571,6 +601,14 @@ export class BodyChecker {
       const loan = this.body.loans[loanId];
       if (loan.place.proj.some((p) => p.k === "deref" && p.via !== "box")) continue;
       const decl = this.body.locals[loan.place.local];
+      if (decl.kind === "upvar" || decl.kind === "static") continue;
+      if (loan.capture) {
+        this.report(`E0373:${loan.span.start}`, () => {
+          this.diags.error("borrowck", loan.span, `closure may outlive the current function, but it borrows \`${decl.name ?? "value"}\`, which is owned by the current function`, "E0373")
+            .help("to force the closure to take ownership of the variables it uses, add the `move` keyword");
+        });
+        continue;
+      }
       this.report(`E0515:${loan.span.start}`, () => {
         const what = decl.kind === "temp" ? "temporary value" : `local variable \`${decl.name}\``;
         const direct = this.body.locals[0].ty.k === "ref";
@@ -614,7 +652,7 @@ export class BodyChecker {
         if (pendingDeref) s = `*${s}`;
         pendingDeref = true;
       } else if (pr.k === "field") {
-        s = `${s}.${pr.name ?? pr.index}`;
+        s = pr.elem ? `${s}[..]` : `${s}.${pr.name ?? pr.index}`;
         pendingDeref = false;
       } else {
         s = `${s}[..]`;

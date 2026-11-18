@@ -20,8 +20,10 @@
  */
 import type { Span } from "../diagnostics.ts";
 import type * as A from "../parser/ast.ts";
+import { patternBindings } from "../parser/visit.ts";
 import type { DefId } from "../resolve/defs.ts";
-import type { TypeckResults } from "../typeck/results.ts";
+import { isRestPat } from "../typeck/exhaustive.ts";
+import { isPromotable, type ClosureInfo, type ClosureKind, type TypeckResults } from "../typeck/results.ts";
 import type { TyCtxt } from "../typeck/tcx.ts";
 import type { TraitSolver } from "../typeck/traits.ts";
 import { ERROR, UNIT, substitute, type Ty } from "../typeck/types.ts";
@@ -45,6 +47,11 @@ export class Lowerer {
   private readonly localOf = new Map<A.NodeId, Local>();
   private readonly scopes: Local[][] = [];
   private readonly loops = new Map<A.NodeId, LoopTarget>();
+  /** While lowering a closure body: the outer variables it mentions. */
+  private readonly upvars = new Map<A.NodeId, Local>();
+  private readonly upvarRoots = new Map<Local, A.NodeId>();
+  private inClosure = false;
+  private readonly staticLocals = new Map<DefId, Local>();
   /** Temps created by `&place`, so calls can tell the reference apart from what it points to. */
   readonly borrowOf = new Map<Local, Place>();
 
@@ -114,8 +121,11 @@ export class Lowerer {
 
   /** Can a value of this type contain a borrow? (references, ADTs with lifetimes, generic params) */
   mayHoldRefs(t: Ty): boolean {
-    if (t.k === "ref" || t.k === "param" || t.k === "proj") return true;
+    if (t.k === "ref" || t.k === "param" || t.k === "proj" || t.k === "opaque") return true;
     if (t.k === "tuple") return t.elems.some((e) => this.mayHoldRefs(e));
+    if (t.k === "array") return this.mayHoldRefs(t.elem);
+    if (t.k === "slice") return this.mayHoldRefs(t.elem);
+    if (t.k === "closure") return (this.r.closures.get(t.id)?.captures ?? []).some((c) => c.by !== undefined || this.mayHoldRefs(c.ty));
     if (t.k === "adt") {
       const node = this.tcx.defs[t.def].node as A.StructItem | A.EnumItem | undefined;
       if (node && node.generics.lifetimes.length) return true;
@@ -128,9 +138,9 @@ export class Lowerer {
     return { k: this.isCopy(ty) ? "copy" : "move", place, refs: this.mayHoldRefs(ty) };
   }
 
-  private loan(place: Place, mutable: boolean, span: Span, implicit = false): number {
+  private loan(place: Place, mutable: boolean, span: Span, implicit = false, capture = false): number {
     const id = this.body.loans.length;
-    this.body.loans.push({ id, place, mutable, span, implicit });
+    this.body.loans.push({ id, place, mutable, span, implicit, capture });
     return id;
   }
 
@@ -183,6 +193,58 @@ export class Lowerer {
     return this.body;
   }
 
+  /** Lower a closure's body as a function of its parameters; outer variables become `upvar` locals. */
+  lowerClosure(info: ClosureInfo): Body {
+    const e = info.node;
+    this.inClosure = true;
+    this.newLocal({ ty: info.ret, mutable: true, span: e.span, kind: "return", name: "return" });
+    this.scopes.push([]);
+    const later: { pat: A.Pattern; local: Local; ty: Ty }[] = [];
+    e.params.forEach((p, i) => {
+      const simple = p.pat.kind === "ident" && !this.tcx.res.patternPaths.has(p.pat.id);
+      const local = simple ? this.r.locals.get(p.pat.id) : undefined;
+      const l = this.newLocal({ ty: info.params[i], mutable: local?.mutable ?? false, span: p.pat.span, kind: "arg", name: local?.name });
+      if (simple) this.localOf.set(p.pat.id, l);
+      else later.push({ pat: p.pat, local: l, ty: info.params[i] });
+    });
+    this.body.argCount = this.body.locals.length - 1;
+    for (const a of later) {
+      this.declarePatternLocals(a.pat);
+      this.bindPattern(a.pat, { local: a.local, proj: [] }, a.ty);
+    }
+    this.lowerInto({ local: 0, proj: [] }, e.body);
+    this.endScope(e.body.span);
+    this.terminate({ k: "return", span: e.body.span });
+    return this.body;
+  }
+
+  /** The outer variable an `upvar` local stands for. */
+  upvarRoot(l: Local): A.NodeId | undefined {
+    return this.upvarRoots.get(l);
+  }
+
+  /** The local for a variable, which inside a closure may belong to the enclosing function. */
+  private localFor(id: A.NodeId): Local | undefined {
+    const known = this.localOf.get(id) ?? this.upvars.get(id);
+    if (known !== undefined || !this.inClosure) return known;
+    const info = this.r.locals.get(id);
+    if (!info) return undefined;
+    const l = this.newLocal({ ty: info.ty, mutable: info.mutable, span: info.span, kind: "upvar", name: info.name });
+    this.upvars.set(id, l);
+    this.upvarRoots.set(l, id);
+    return l;
+  }
+
+  private staticLocal(def: DefId): Local {
+    let l = this.staticLocals.get(def);
+    if (l === undefined) {
+      const node = this.tcx.defs[def].node as A.ConstItem;
+      l = this.newLocal({ ty: this.tcx.constTy(def), mutable: !!node.mutable, span: node.span, kind: "static", name: node.name });
+      this.staticLocals.set(def, l);
+    }
+    return l;
+  }
+
   private declarePatternLocals(p: A.Pattern) {
     const scope = this.scopes[this.scopes.length - 1];
     const visit = (p: A.Pattern) => {
@@ -193,13 +255,24 @@ export class Lowerer {
           const l = this.newLocal({ ty: info?.ty ?? ERROR, mutable: info?.mutable ?? false, span: p.span, kind: "user", name: p.name });
           this.localOf.set(p.id, l);
           scope.push(l);
-          if (p.sub) visit(p.sub);
+          if (p.sub && p.sub.kind !== "rest") visit(p.sub);
           return;
         }
-        case "tuple": case "tupleStruct": p.elems.forEach(visit); return;
+        case "tuple": case "tupleStruct": case "slice": p.elems.forEach(visit); return;
         case "struct": p.fields.forEach((f) => visit(f.pat)); return;
         case "ref": visit(p.inner); return;
-        case "or": visit(p.alts[0]); return;
+        case "or": {
+          visit(p.alts[0]);
+          // Every alternative binds the same names; they share one local each.
+          const byName = new Map(patternBindings(p.alts[0]).map((b) => [(b as { name: string }).name, this.localOf.get(b.id)]));
+          for (const alt of p.alts.slice(1)) {
+            for (const b of patternBindings(alt)) {
+              const l = byName.get((b as { name: string }).name);
+              if (l !== undefined) this.localOf.set(b.id, l);
+            }
+          }
+          return;
+        }
       }
     };
     visit(p);
@@ -224,7 +297,9 @@ export class Lowerer {
 
   private derefVia(t: Ty): Projection {
     if (t.k === "ref") return { k: "deref", via: t.mutable ? "refMut" : "ref" };
-    if (t.k === "adt" && this.tcx.isLang(t.def, "Box")) return { k: "deref", via: "box" };
+    if (t.k === "ptr") return { k: "deref", via: t.mutable ? "rawMut" : "raw" };
+    // A `Box`, `Vec`, `String` or array owns what the deref reaches.
+    if (t.k === "array" || (t.k === "adt" && ["Box", "Vec", "String"].some((n) => this.tcx.isLang(t.def, n)))) return { k: "deref", via: "box" };
     return { k: "deref", via: "other" };
   }
 
@@ -236,13 +311,17 @@ export class Lowerer {
     let proj = [...place.proj];
     for (const step of adj.derefs) {
       proj.push(this.derefVia(ty));
-      ty = step === "string" ? { k: "str" } : ty.k === "ref" ? ty.inner : ty.k === "adt" ? ty.args[0] ?? ERROR : ERROR;
+      ty = step === "string" ? { k: "str" }
+        : step === "vec" && ty.k === "adt" ? { k: "slice", elem: ty.args[0] }
+        : step === "unsize" && ty.k === "array" ? { k: "slice", elem: ty.elem }
+        : ty.k === "ref" ? ty.inner : ty.k === "adt" ? ty.args[0] ?? ERROR : ERROR;
     }
     return { place: { local: place.local, proj }, ty };
   }
 
   private isPlaceExpr(e: A.Expr): boolean {
     if (e.kind === "path") {
+      if (this.r.statics.has(e.id)) return true;
       const pr = this.tcx.res.paths.get(e.path.id);
       return pr?.base.kind === "local" && pr.unresolved.length === 0;
     }
@@ -256,9 +335,11 @@ export class Lowerer {
   lowerPlace(e: A.Expr): Place {
     switch (e.kind) {
       case "path": {
+        const st = this.r.statics.get(e.id);
+        if (st !== undefined) return { local: this.staticLocal(st), proj: [] };
         const pr = this.tcx.res.paths.get(e.path.id);
         if (pr?.base.kind === "local" && pr.unresolved.length === 0) {
-          const l = this.localOf.get(pr.base.id);
+          const l = this.localFor(pr.base.id);
           if (l !== undefined) return { local: l, proj: [] };
         }
         break;
@@ -281,13 +362,13 @@ export class Lowerer {
           this.assign({ local: ref, proj: [] }, { k: "call", ops: [{ k: "move", place: { local: borrowTmp, proj: [] } }, key], flows: ["full", "none"], name: "index" }, e.span);
           return { local: ref, proj: [{ k: "deref", via: "ref" }] };
         }
-        if (this.r.strSlices.has(e.id) && e.index.kind === "range") {
+        if ((this.r.strSlices.has(e.id) || this.r.sliceRanges.has(e.id)) && e.index.kind === "range") {
           for (const bound of [e.index.start, e.index.end]) if (bound) this.consume(this.lowerOperand(bound), bound.span);
           return { local: base.place.local, proj: [...base.place.proj, { k: "index" }] };
         }
         const idx = this.lowerOperand(e.index);
         this.consume(idx, e.index.span);
-        return { local: base.place.local, proj: [...base.place.proj, { k: "index" }] };
+        return { local: base.place.local, proj: [...base.place.proj, { k: "index", seq: base.ty.k === "array" || base.ty.k === "slice" }] };
       }
       case "unary": {
         if (e.op !== "*") break;
@@ -308,9 +389,7 @@ export class Lowerer {
   /** Evaluate `e` as an operand: a const, or a copy/move of a place. */
   lowerOperand(e: A.Expr): RefOperand {
     if (e.kind === "lit") return { k: "const" };
-    if (e.kind === "path" && !this.isPlaceExpr(e)) {
-      if (this.r.ctors.has(e.id) || this.r.callees.has(e.id)) return { k: "const" };
-    }
+    if (e.kind === "path" && !this.isPlaceExpr(e)) return { k: "const" };
     if (this.isPlaceExpr(e)) {
       const { place, ty } = this.applyDerefs(this.lowerPlace(e), e);
       return this.operand(place, ty);
@@ -331,7 +410,7 @@ export class Lowerer {
    */
   private lowerArg(e: A.Expr): RefOperand {
     const t = this.tyOf(e.id);
-    if (t.k === "ref" && t.mutable && this.isPlaceExpr(e) && !this.r.coercions.has(e.id)) {
+    if (t.k === "ref" && t.mutable && this.isPlaceExpr(e)) {
       const { place } = this.applyDerefs(this.lowerPlace(e), e);
       const target: Place = { local: place.local, proj: [...place.proj, { k: "deref", via: "refMut" }] };
       const l = this.loan(target, true, e.span, true);
@@ -368,8 +447,26 @@ export class Lowerer {
         else this.assign(dest, { k: "pure", ops: [op] }, span);
         return;
       }
+      case "array":
+        this.assign(dest, { k: "aggregate", ops: e.elems.map((x) => this.lowerOperand(x)) }, span);
+        return;
+      case "repeat":
+        this.assign(dest, { k: "aggregate", ops: [this.lowerOperand(e.value)] }, span);
+        return;
+      case "closure": return this.lowerClosureExpr(dest, e);
       case "ref": {
+        if (!e.mutable && !e.raw && isPromotable(e.expr, this.r)) {
+          this.assign(dest, { k: "use", op: { k: "const" } }, span); // static data: nothing to borrow
+          return;
+        }
         const inner = this.isPlaceExpr(e.expr) ? this.applyDerefs(this.lowerPlace(e.expr), e.expr).place : this.lowerToTemp(e.expr);
+        if (e.raw) {
+          // `&raw` creates no lasting loan, but the place must still be accessible this way.
+          const t = this.temp({ k: "ref", mutable: e.mutable, inner: this.tyOf(e.expr.id) }, span);
+          this.assign({ local: t, proj: [] }, { k: "ref", mutable: e.mutable, place: inner, loan: this.loan(inner, e.mutable, span) }, span);
+          this.assign(dest, { k: "pure", ops: [{ k: "copy", place: { local: t, proj: [] } }] }, span);
+          return;
+        }
         const l = this.loan(inner, e.mutable, span);
         this.assign(dest, { k: "ref", mutable: e.mutable, place: inner, loan: l }, span);
         if (dest.proj.length === 0) this.borrowOf.set(dest.local, inner);
@@ -382,6 +479,7 @@ export class Lowerer {
         return;
       }
       case "call": {
+        if (this.r.valueCalls.has(e.id)) return this.lowerValueCall(dest, e);
         const ops = e.args.map((a) => this.lowerArg(a));
         const ctor = this.r.ctors.get(e.id);
         const callee = this.r.callees.get(e.id);
@@ -490,6 +588,49 @@ export class Lowerer {
     }
   }
 
+  /** Building a closure borrows or moves everything it captures, right here. */
+  private lowerClosureExpr(dest: Place, e: Extract<A.Expr, { kind: "closure" }>) {
+    const info = this.r.closures.get(e.id)!;
+    const ops: RefOperand[] = [];
+    for (const c of info.captures ?? []) {
+      const root = this.localFor(c.root);
+      if (root === undefined) continue;
+      const place: Place = { local: root, proj: c.proj.map((p): Projection => (p.k === "field" ? { k: "field", index: p.index } : { k: "deref", via: p.via })) };
+      if (c.by === undefined) { ops.push(this.operand(place, c.ty)); continue; }
+      const mutable = c.by === "mut";
+      const t = this.temp({ k: "ref", mutable, inner: c.ty }, e.span);
+      this.assign({ local: t, proj: [] }, { k: "ref", mutable, place, loan: this.loan(place, mutable, e.span, false, true) }, e.span);
+      ops.push({ k: "move", place: { local: t, proj: [] }, refs: true });
+    }
+    this.assign(dest, { k: "aggregate", ops }, e.span);
+  }
+
+  /** `f(x)` through a value. `Fn` borrows `f`, `FnMut` borrows it mutably, `FnOnce` consumes it. */
+  private lowerValueCall(dest: Place, e: Extract<A.Expr, { kind: "call" }>) {
+    const base = this.isPlaceExpr(e.callee) ? this.lowerPlace(e.callee) : this.lowerToTemp(e.callee);
+    const { place, ty } = this.applyDerefs(base, e.callee);
+    const args = e.args.map((a) => this.lowerArg(a));
+    let kind: ClosureKind = this.r.valueCalls.get(e.id) ?? "Fn";
+    if (ty.k === "closure") kind = this.r.closures.get(ty.id)?.kind ?? "Fn";
+    let callee: RefOperand;
+    let flow: ArgFlow = "inner";
+    // Calling through `&mut f` reborrows; through `&f` it just reads.
+    if (ty.k === "ref" && !ty.mutable) kind = "Fn";
+    if (kind === "FnOnce") {
+      callee = this.operand(place, ty);
+      flow = "full";
+    } else {
+      const mutable = kind === "FnMut";
+      const target: Place = ty.k === "ref" ? { local: place.local, proj: [...place.proj, this.derefVia(ty)] } : place;
+      const t = this.temp({ k: "ref", mutable, inner: ty }, e.span);
+      this.assign({ local: t, proj: [] }, { k: "ref", mutable, place: target, loan: this.loan(target, mutable, e.callee.span, true) }, e.span);
+      this.borrowOf.set(t, target);
+      callee = { k: "move", place: { local: t, proj: [] }, refs: true };
+    }
+    this.assign(dest, { k: "call", ops: [callee, ...args], flows: [flow, ...args.map((): ArgFlow => "full")], name: "closure" }, e.span);
+    if (this.tyOf(e.id).k === "never") this.terminate({ k: "unreachable" });
+  }
+
   private lowerBinary(dest: Place, e: Extract<A.Expr, { kind: "binary" }>) {
     const span = e.span;
     if (e.op === "&&" || e.op === "||") {
@@ -595,7 +736,9 @@ export class Lowerer {
     if (simple) {
       // Evaluate the initializer *before* the binding comes into scope (shadowing!).
       const t = this.temp(this.tyOf(s.pat.id), s.init.span);
-      this.lowerInto({ local: t, proj: [] }, s.init);
+      // With a written type, `let r: &mut T = other;` reborrows instead of moving.
+      if (s.ty) this.assign({ local: t, proj: [] }, { k: "use", op: this.lowerArg(s.init) }, s.init.span);
+      else this.lowerInto({ local: t, proj: [] }, s.init);
       this.declarePatternLocals(s.pat);
       const l = this.localOf.get(s.pat.id)!;
       this.assign({ local: l, proj: [] }, { k: "use", op: this.operand({ local: t, proj: [] }, this.tyOf(s.pat.id)) }, s.span);
@@ -626,7 +769,21 @@ export class Lowerer {
           const l = this.loan(place, mode === "refMut", p.span);
           this.assign({ local, proj: [] }, { k: "ref", mutable: mode === "refMut", place, loan: l }, p.span);
         }
-        if (p.sub) this.bindPattern(p.sub, place, valTy);
+        if (p.sub && p.sub.kind !== "rest") this.bindPattern(p.sub, place, valTy);
+        return;
+      }
+      case "slice": {
+        const t = this.r.types.get(p.id) ?? ty;
+        const elem = t.k === "array" || t.k === "slice" ? t.elem : ERROR;
+        const at = p.elems.findIndex(isRestPat);
+        const n = t.k === "array" && t.len.k === "constval" ? t.len.n : undefined;
+        p.elems.forEach((x, i) => {
+          // Distinct positions are disjoint; from the end they count down from -1.
+          const fromEnd = at >= 0 && i > at;
+          const index = i === at ? 1e9 : !fromEnd ? i : n !== undefined ? n - (p.elems.length - i) : i - p.elems.length;
+          const sub: Place = { local: place.local, proj: [...place.proj, { k: "field", index, elem: true }] };
+          this.bindPattern(x, sub, i === at ? this.r.types.get(x.id) ?? ERROR : elem);
+        });
         return;
       }
       case "tuple": {
@@ -719,10 +876,15 @@ export class Lowerer {
     const span = e.span;
     // Format arguments are taken by reference: inspect them, never move them.
     const inspectAll = (exprs: A.Expr[]) => {
-      for (const a of exprs) {
-        if (this.isPlaceExpr(a)) this.emit({ k: "inspect", place: this.applyDerefs(this.lowerPlace(a), a).place, span: a.span });
-        else this.lowerToTemp(a);
-      }
+      // Every argument is borrowed until formatting happens, after all of them are evaluated.
+      const places = exprs.map((a): [Place, Span] => {
+        if (!this.isPlaceExpr(a)) return [this.lowerToTemp(a), a.span];
+        const { place, ty } = this.applyDerefs(this.lowerPlace(a), a);
+        const t = this.temp({ k: "ref", mutable: false, inner: ty }, a.span);
+        this.assign({ local: t, proj: [] }, { k: "ref", mutable: false, place, loan: this.loan(place, false, a.span, true) }, a.span);
+        return [{ local: t, proj: [] }, a.span];
+      });
+      for (const [place, s] of places) this.emit({ k: "inspect", place, span: s });
     };
     switch (e.name) {
       case "vec": {

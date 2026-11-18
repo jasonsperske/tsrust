@@ -220,6 +220,8 @@ export class Assembler {
   jmp(l: Label) { this.b(0xe9); const at = this.pos; this.d32(0); this.fixups.push({ at, next: this.pos, target: l }); }
   jcc(cc: CC, l: Label) { this.b(0x0f, 0x80 + cc); const at = this.pos; this.d32(0); this.fixups.push({ at, next: this.pos, target: l }); }
   call(target: Label | { abs: string }) { this.b(0xe8); const at = this.pos; this.d32(0); this.fixups.push({ at, next: this.pos, target }); }
+  /** call rax */
+  callRax() { this.b(0xff, 0xd0); }
   /** call qword [rip + target] (calls through an import table slot) */
   callRipMem(target: Label | { abs: string }) { this.b(0xff); this.modrmRip(2, target); }
   ret() { this.b(0xc3); }

@@ -46,7 +46,7 @@ export interface Token {
 export const KEYWORDS = new Set([
   "as", "break", "const", "continue", "crate", "else", "enum", "false", "fn", "for",
   "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-  "return", "self", "Self", "struct", "super", "trait", "true", "type", "use", "where", "while",
+  "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
 ]);
 
 /**

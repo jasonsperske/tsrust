@@ -207,5 +207,6 @@ The chapters follow the pipeline. Each one stands alone, but they are easiest in
 13. [The standard library](13-standard-library.md): `std` written in Rust, plus intrinsics
 14. [Differences from Rust](14-differences-from-rust.md): every simplification in one place
 15. [Native code and executable formats](15-native-code.md): x86-64, the runtime library, ELF, Mach-O and PE
+16. [Closures, slices and `unsafe`](16-closures-slices-unsafe.md): how the newest features cross every stage
 
 A good way to read: keep the playground open next to the chapter, load the example the chapter mentions, and watch the relevant tab while you read the code.

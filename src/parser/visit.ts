@@ -16,7 +16,9 @@ export function forEachChildExpr(e: A.Expr, f: (child: A.Expr) => void): void {
     case "methodCall": f(e.receiver); e.args.forEach(f); return;
     case "index": f(e.expr); f(e.index); return;
     case "structLit": e.fields.forEach((x) => f(x.value)); if (e.base) f(e.base); return;
-    case "tuple": e.elems.forEach(f); return;
+    case "tuple": case "array": e.elems.forEach(f); return;
+    case "repeat": f(e.value); f(e.len); return;
+    case "closure": f(e.body); return;
     case "block":
       for (const s of e.stmts) {
         if (s.kind === "let") { if (s.init) f(s.init); }
@@ -45,7 +47,7 @@ export function forEachBlock(e: A.Expr, f: (block: A.BlockExpr) => void): void {
 export function patternBindings(p: A.Pattern, out: A.Pattern[] = []): A.Pattern[] {
   switch (p.kind) {
     case "ident": out.push(p); if (p.sub) patternBindings(p.sub, out); break;
-    case "tuple": case "tupleStruct": p.elems.forEach((x) => patternBindings(x, out)); break;
+    case "tuple": case "tupleStruct": case "slice": p.elems.forEach((x) => patternBindings(x, out)); break;
     case "struct": p.fields.forEach((x) => patternBindings(x.pat, out)); break;
     case "ref": patternBindings(p.inner, out); break;
     case "or": patternBindings(p.alts[0], out); break;

@@ -46,13 +46,16 @@ export interface LocalDecl {
   ty: Ty;
   mutable: boolean;
   span: Span;
-  kind: "return" | "arg" | "user" | "temp";
+  /** `upvar`: an outer variable used by the closure being lowered. */
+  kind: "return" | "arg" | "user" | "temp" | "upvar" | "static";
 }
 
 export type Projection =
-  | { k: "deref"; via: "ref" | "refMut" | "box" | "other" }
-  | { k: "field"; index: number; variant?: number; name?: string }
-  | { k: "index" };
+  /** `box` also covers owners that deref to their contents: `Vec`, `String`, arrays. */
+  | { k: "deref"; via: "ref" | "refMut" | "box" | "raw" | "rawMut" | "other" }
+  /** `elem` marks a constant array or slice position, as bound by `[a, b, ..]`. */
+  | { k: "field"; index: number; variant?: number; name?: string; elem?: boolean }
+  | { k: "index"; seq?: boolean };
 
 export interface Place {
   local: Local;
@@ -101,6 +104,8 @@ export interface Loan {
   span: Span;
   /** True for borrows the compiler inserted for a method receiver (`v.push(..)` borrows `v`). */
   implicit: boolean;
+  /** A closure's capture of an outer variable. */
+  capture?: boolean;
 }
 
 export interface Body {

@@ -68,12 +68,122 @@ impl<T> Vec<T> {
         }
     }
 
-    pub fn iter(&self) -> Iter<T> {
-        Iter { vec: self, pos: 0 }
+    pub fn as_slice(&self) -> &[T] {
+        self
     }
 
-    pub fn iter_mut(&mut self) -> IterMut<T> {
-        IterMut { vec: self, pos: 0 }
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self
+    }
+
+    pub fn iter(&self) -> crate::slice::Iter<T> {
+        self.as_slice().iter()
+    }
+
+    pub fn iter_mut(&mut self) -> crate::slice::IterMut<T> {
+        self.as_mut_slice().iter_mut()
+    }
+
+    /// Build a vector by calling `f` with each index in order.
+    pub fn from_fn<F: FnMut(usize) -> T>(length: usize, mut f: F) -> Vec<T> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < length {
+            out.push(f(i));
+            i += 1;
+        }
+        out
+    }
+
+    pub fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I)
+    where
+        I::IntoIter: Iterator<Item = T>,
+    {
+        for x in iter.into_iter() {
+            self.push(x);
+        }
+    }
+
+    pub fn retain<F: FnMut(&T) -> bool>(&mut self, mut keep: F) {
+        let n = self.len();
+        let mut kept = 0;
+        let mut i = 0;
+        while i < n {
+            if keep(&self[i]) {
+                if kept != i {
+                    self.swap(kept, i);
+                }
+                kept += 1;
+            }
+            i += 1;
+        }
+        self.truncate(kept);
+    }
+
+    pub fn dedup_by_key<K: PartialEq, F: FnMut(&mut T) -> K>(&mut self, mut key: F) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        let mut kept = 1;
+        let mut i = 1;
+        while i < n {
+            if key(&mut self[i]) != key(&mut self[kept - 1]) {
+                self.swap(kept, i);
+                kept += 1;
+            }
+            i += 1;
+        }
+        self.truncate(kept);
+    }
+
+    pub fn split_off(&mut self, at: usize) -> Vec<T> {
+        assert!(at <= self.len(), "`at` split index out of bounds");
+        let mut out = Vec::new();
+        let mut i = at;
+        while i < self.len() {
+            out.push(self[i]);
+            i += 1;
+        }
+        self.truncate(at);
+        out
+    }
+}
+
+impl<T: PartialEq> Vec<T> {
+    pub fn dedup(&mut self) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        let mut kept = 1;
+        let mut i = 1;
+        while i < n {
+            if self[i] != self[kept - 1] {
+                self.swap(kept, i);
+                kept += 1;
+            }
+            i += 1;
+        }
+        self.truncate(kept);
+    }
+}
+
+impl<T> crate::iter::Extend<T> for Vec<T> {
+    fn extend_one(&mut self, item: T) {
+        self.push(item);
+    }
+}
+
+impl<'a, T: Copy> crate::iter::Extend<&'a T> for Vec<T> {
+    fn extend_one(&mut self, item: &'a T) {
+        self.push(*item);
+    }
+}
+
+impl<T: Clone> From<&[T]> for Vec<T> {
+    fn from(s: &[T]) -> Vec<T> {
+        s.to_vec()
     }
 }
 
@@ -88,22 +198,13 @@ impl<T: PartialEq> Vec<T> {
     }
 }
 
-impl<T: Ord> Vec<T> {
-    /// Insertion sort, written in Rust. Uses `Ord::cmp` on the elements.
-    pub fn sort(&mut self) {
-        let mut i = 1;
-        while i < self.len() {
-            let mut j = i;
-            while j > 0 && self[j - 1] > self[j] {
-                self.swap(j - 1, j);
-                j -= 1;
-            }
-            i += 1;
+impl<T: Clone> Vec<T> {
+    pub fn extend_from_slice(&mut self, other: &[T]) {
+        for item in other.iter() {
+            self.push(item.clone());
         }
     }
-}
 
-impl<T: Clone> Vec<T> {
     pub fn extend_from_vec(&mut self, other: &Vec<T>) {
         for item in other.iter() {
             self.push(item.clone());
@@ -154,54 +255,18 @@ impl<T: Debug> Debug for Vec<T> {
 /// the vector and never yields the same index twice.
 fn take_unchecked<T>(vec: &mut Vec<T>, index: usize) -> T;
 
-/// Borrowing iterator: yields `&T`.
-pub struct Iter<'a, T> {
-    vec: &'a Vec<T>,
-    pos: usize,
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-    fn next(&mut self) -> Option<&'a T> {
-        if self.pos < self.vec.len() {
-            let item = &self.vec[self.pos];
-            self.pos += 1;
-            Some(item)
-        } else {
-            None
-        }
-    }
-}
-
-/// Mutably borrowing iterator: yields `&mut T`.
-pub struct IterMut<'a, T> {
-    vec: &'a mut Vec<T>,
-    pos: usize,
-}
-
-impl<'a, T> Iterator for IterMut<'a, T> {
-    type Item = &'a mut T;
-    fn next(&mut self) -> Option<&'a mut T> {
-        if self.pos < self.vec.len() {
-            let item = &mut self.vec[self.pos];
-            self.pos += 1;
-            Some(item)
-        } else {
-            None
-        }
-    }
-}
-
 /// Owning iterator: `for x in vec` moves each element out.
+#[derive(Clone)]
 pub struct IntoIter<T> {
     vec: Vec<T>,
     pos: usize,
+    end: usize,
 }
 
 impl<T> Iterator for IntoIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
-        if self.pos < self.vec.len() {
+        if self.pos < self.end {
             let index = self.pos;
             self.pos += 1;
             Some(take_unchecked(&mut self.vec, index))
@@ -211,26 +276,44 @@ impl<T> Iterator for IntoIter<T> {
     }
 }
 
+impl<T> crate::iter::DoubleEndedIterator for IntoIter<T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.pos < self.end {
+            self.end -= 1;
+            Some(take_unchecked(&mut self.vec, self.end))
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> crate::iter::ExactSizeIterator for IntoIter<T> {
+    fn len(&self) -> usize {
+        self.end - self.pos
+    }
+}
+
 impl<T> IntoIterator for Vec<T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
     fn into_iter(self) -> IntoIter<T> {
-        IntoIter { vec: self, pos: 0 }
+        let end = self.len();
+        IntoIter { vec: self, pos: 0, end: end }
     }
 }
 
 impl<'a, T> IntoIterator for &'a Vec<T> {
     type Item = &'a T;
-    type IntoIter = Iter<'a, T>;
-    fn into_iter(self) -> Iter<'a, T> {
+    type IntoIter = crate::slice::Iter<'a, T>;
+    fn into_iter(self) -> crate::slice::Iter<'a, T> {
         self.iter()
     }
 }
 
 impl<'a, T> IntoIterator for &'a mut Vec<T> {
     type Item = &'a mut T;
-    type IntoIter = IterMut<'a, T>;
-    fn into_iter(self) -> IterMut<'a, T> {
+    type IntoIter = crate::slice::IterMut<'a, T>;
+    fn into_iter(self) -> crate::slice::IterMut<'a, T> {
         self.iter_mut()
     }
 }
