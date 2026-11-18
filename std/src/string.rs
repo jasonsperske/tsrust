@@ -76,6 +76,26 @@ impl crate::iter::FromIterator<char> for String {
     }
 }
 
+impl<'a> crate::iter::FromIterator<&'a char> for String {
+    fn from_iter<I: Iterator<Item = &'a char>>(iter: I) -> String {
+        let mut s = String::new();
+        for c in iter {
+            s.push(*c);
+        }
+        s
+    }
+}
+
+impl crate::iter::FromIterator<String> for String {
+    fn from_iter<I: Iterator<Item = String>>(iter: I) -> String {
+        let mut s = String::new();
+        for part in iter {
+            s.push_str(part.as_str());
+        }
+        s
+    }
+}
+
 impl<'a> crate::iter::FromIterator<&'a str> for String {
     fn from_iter<I: Iterator<Item = &'a str>>(iter: I) -> String {
         let mut s = String::new();

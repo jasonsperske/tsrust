@@ -158,11 +158,11 @@ Both are plain enums. `Option` derives `Clone, Copy, PartialEq, Eq, PartialOrd, 
 impl<T, E: Debug> Result<T, E> {
 ```
 
-The library has **no** closure-taking combinators: no `map`, `and_then`, `unwrap_or_else` or `filter`. TSRust has no closures yet ([14-differences-from-rust.md](14-differences-from-rust.md)).
+Closure-taking combinators such as `map`, `and_then`, `unwrap_or_else` and `filter` are ordinary Rust in [std/src/option.rs](../std/src/option.rs) and [std/src/result.rs](../std/src/result.rs).
 
-### Iterator adapters without closures
+### Iterator adapters
 
-`Iterator` has one required method, `next`, and a set of provided methods with default bodies. Without closures, the adapters are the ones that need no function argument: `enumerate`, `skip`, `take`, `step_by`, `zip` and `chain`, plus the consumers `count`, `last`, `nth`, `sum`, `product` and `collect`. Each adapter is a generic struct wrapping the inner iterator:
+`Iterator` has one required method, `next`, and a set of provided methods with default bodies. Adapters are structs wrapping another iterator, some with a closure beside it (`Map`, `Filter`, `TakeWhile`...). Among those needing no function argument: `enumerate`, `skip`, `take`, `step_by`, `zip` and `chain`, plus the consumers `count`, `last`, `nth`, `sum`, `product` and `collect`. Each adapter is a generic struct wrapping the inner iterator:
 
 ```rust
 impl<I: Iterator> Iterator for Enumerate<I> {
@@ -302,7 +302,7 @@ An intrinsic missing from the VM's table compiles fine but fails at runtime with
 
 ## Where TSRust differs from rustc
 
-- **Much smaller.** No slices, no `Rc`/`RefCell`, no `BTreeMap`/`HashSet`/`VecDeque`, no I/O beyond printing, and no closure-taking APIs (`map`, `filter`, `sort_by`, `unwrap_or_else`...).
+- **Much smaller.** No `Rc`/`RefCell`, no `BTreeMap`/`HashSet`/`VecDeque`, and no I/O beyond printing.
 - **Lang items are a table**, not `#[lang]` attributes, and the trait-solver's built-in impls for primitives and `String` are hard-coded in [src/typeck/traits.ts](../src/typeck/traits.ts) instead of being written in the library.
 - **No `Borrow` trait.** `HashMap::get` takes `&K` exactly, so a `HashMap<&str, V>` needs `map.get(&"key")`.
 - **Non-standard helpers.** `str::slice(start, end)` and `str::char_count()` exist to implement `&s[a..b]` and to count characters cheaply. `Vec::extend_from_vec` stands in for `extend`.

@@ -15,7 +15,42 @@ import type { Ty } from "./types.ts";
 export type DerefStep =
   | "ref" // &T → T
   | "box" // Box<T> → T
-  | "string"; // String → str (Deref coercion)
+  | "string" // String → str (Deref coercion)
+  | "vec" // Vec<T> → [T]
+  | "unsize" // [T; N] → [T]
+  | "fnptr"; // a fn item or non-capturing closure → fn pointer (coercions only)
+
+export type ClosureKind = "Fn" | "FnMut" | "FnOnce";
+
+/** One step of a captured place: `x.0`, `*x`. */
+export type CaptureProj = { k: "field"; index: number } | { k: "deref"; via: "ref" | "refMut" | "box" | "raw" | "rawMut" | "other" };
+
+/** One thing a closure captures, found by `borrowck/captures.ts`. */
+export interface Capture {
+  root: A.NodeId;
+  proj: CaptureProj[];
+  /** How the place is held: by reference, or (`undefined`) by value. */
+  by?: "ref" | "mut";
+  /** The type of the captured place itself. */
+  ty: Ty;
+}
+
+export interface ClosureInfo {
+  node: Extract<A.Expr, { kind: "closure" }>;
+  /** The function or const whose body contains the closure. */
+  owner: DefId;
+  params: Ty[];
+  ret: Ty;
+  /** From the bound it was passed to (`F: Fn(..)`), if any. */
+  expectedKind?: ClosureKind;
+  /** Bounds it must satisfy, checked once its kind is known. */
+  required: { kind: ClosureKind; span: A.Expr["span"] }[];
+  /** Filled in by capture analysis, after type checking. */
+  captures?: Capture[];
+  kind?: ClosureKind;
+  /** Set when it was coerced to a `fn` pointer, which requires it to capture nothing. */
+  toFnPtr?: A.Expr["span"];
+}
 
 /**
  * Implicit operations inserted on an expression: dereference it `derefs`
@@ -71,16 +106,46 @@ export interface TypeckResults {
   bindingModes: Map<A.NodeId, BindingMode>;
   /** Number of references implicitly peeled before matching a pattern (match ergonomics). */
   patDerefs: Map<A.NodeId, number>;
-  /** Field expressions and struct-literal fields → field index. */
+  /** Field expressions and struct-pattern fields → field index. */
   fieldIndices: Map<A.NodeId, number>;
+  /** The value of each field in a struct literal → the field it initializes. */
+  litFields: Map<A.NodeId, number>;
   locals: Map<A.NodeId, LocalInfo>;
   forLoops: Map<A.NodeId, ForLoopInfo>;
   /** Index expressions that slice a string by a range: `&s[a..b]`. */
   strSlices: Set<A.NodeId>;
+  /** Index expressions that take a sub-slice of a slice, array or `Vec`: `&v[a..b]`. */
+  sliceRanges: Set<A.NodeId>;
+  /** `==`/`!=` between different sequence types (`vec == [1, 2]`), compared as slices. */
+  seqEq: Set<A.NodeId>;
+  /** Every closure expression. */
+  closures: Map<A.NodeId, ClosureInfo>;
+  /** Calls through a value (closure, `F: Fn`, fn pointer), with how `F` is called (undefined for a closure: see its kind). */
+  valueCalls: Map<A.NodeId, ClosureKind | undefined>;
+  /** Paths naming a const generic parameter. */
+  constParams: Map<A.NodeId, Ty>;
+  /** Paths naming a `static`. */
+  statics: Map<A.NodeId, DefId>;
   /** `?` expressions: which family they propagate. */
   tryKinds: Map<A.NodeId, "option" | "result">;
   /** Methods/fns whose bodies were checked, with their param binding ids. */
   checkedBodies: DefId[];
+}
+
+/**
+ * Can `&e` live forever? A borrow of a constant expression refers to static
+ * data rather than a temporary, so `&[1, 2]` may be returned from a function.
+ */
+export function isPromotable(e: A.Expr, r: TypeckResults): boolean {
+  switch (e.kind) {
+    case "lit": return true;
+    case "unary": return e.op === "-" && e.expr.kind === "lit";
+    case "array": case "tuple": return e.elems.every((x) => isPromotable(x, r));
+    case "repeat": return isPromotable(e.value, r);
+    case "ref": return !e.mutable && !e.raw && isPromotable(e.expr, r);
+    case "path": return r.callees.has(e.id) || r.ctors.has(e.id);
+    default: return false;
+  }
 }
 
 export function emptyResults(): TypeckResults {
@@ -88,5 +153,6 @@ export function emptyResults(): TypeckResults {
     types: new Map(), callees: new Map(), ctors: new Map(), adjustments: new Map(), coercions: new Map(),
     bindingModes: new Map(), patDerefs: new Map(), fieldIndices: new Map(), locals: new Map(),
     forLoops: new Map(), tryKinds: new Map(), strSlices: new Set(), checkedBodies: [],
+    litFields: new Map(), sliceRanges: new Set(), seqEq: new Set(), closures: new Map(), valueCalls: new Map(), constParams: new Map(), statics: new Map(),
   };
 }

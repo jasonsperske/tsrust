@@ -86,10 +86,11 @@ Source** to "GitHub Actions".
 
 Structs, enums, tuples, `impl` blocks, traits with default methods, generics with
 bounds and `where` clauses, associated types, operator overloading, `#[derive]`,
-iterator adapters that need no closures (`enumerate`, `zip`, `skip`, `take`, `step_by`,
-`sum`, `collect`…), `match` with guards and or-patterns, `if let`/`while let`,
-`?`, `Box`, `Vec`, `String`, `HashMap`, modules, privacy, multi-crate packages,
-and the full borrow-checking story.
+closures (`Fn`, `FnMut`, `FnOnce`, `move`, `impl Fn`), `fn` pointers, iterator adapters
+(`map`, `filter`, `fold`, `rev`…), arrays, slices and slice patterns, const generics,
+`unsafe` with raw pointers and `static mut`, `match` with guards and or-patterns,
+`if let`/`while let`, `?`, the never type `!`, `Box`, `Vec`, `String`, `HashMap`, modules,
+privacy, multi-crate packages, and the full borrow-checking story.
 
 Native executables target x86-64 (Apple Silicon Macs run them through Rosetta 2).
 The ELF output is tested by running every example; the Mach-O and PE writers are
@@ -100,9 +101,8 @@ The native runtime library is freestanding C in [`native/runtime`](native/runtim
 precompiled into a committed blob (`npm run build:runtime` regenerates it and needs
 gcc), so building executables never needs a C compiler.
 
-Not yet supported: closures, arrays and slices (beyond `&s[a..b]` on strings),
-trait objects (`dyn`), `macro_rules!`, `Rc`/`RefCell`, and checking of named lifetimes
-inside a function. See [docs/14-differences-from-rust.md](docs/14-differences-from-rust.md).
+Not yet supported: trait objects (`dyn`), `macro_rules!`, `Drop`, `Rc`/`RefCell`, and
+checking of named lifetimes inside a function. See [docs/14-differences-from-rust.md](docs/14-differences-from-rust.md).
 
 ## License
 

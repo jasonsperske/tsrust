@@ -196,6 +196,92 @@ INTRINSIC(vec__from_elem) {
 }
 
 INTRINSIC(Box__new) { UNUSED; V *cell = rt_alloc(8); *cell = A(0); return (V)cell; }
+INTRINSIC(Box__into_raw) { return A(0); }
+INTRINSIC(Box__from_raw) { return A(0); }
+
+/* ------------------------------------------------------------------------ */
+/* Slices, arrays and raw pointers                                           */
+/* ------------------------------------------------------------------------ */
+
+static V slice_view(V *data, u64 len) {
+  Vec *s = rt_alloc(sizeof *s);
+  s->len = len;
+  s->data = data;
+  s->cap = 0;
+  return (V)s;
+}
+EXPORT V rt_as_slice(V *sp) { const Vec *v = (const Vec *)sp[0]; return slice_view(v->data, v->len); }
+
+static void panic_range(const char *a, u64 x, const char *b, u64 y) {
+  StringBuf *m = sb_new();
+  sb_push_cstr(m, a); fmt_u64(m, x); sb_push_cstr(m, b); fmt_u64(m, y);
+  rt_panic_str(m->ptr, m->len);
+}
+INTRINSIC(slice__len) { return ((const Vec *)A(0))->len; }
+INTRINSIC(slice__seq_len) { return ((const Vec *)A(0))->len; }
+INTRINSIC(slice__range) {
+  const Vec *s = (const Vec *)A(0);
+  u64 a = A(1), b = A(2);
+  if (a > b) {
+    if (b == s->len) panic_range("range start index ", a, " out of range for slice of length ", s->len);
+    panic_range("slice index starts at ", a, " but ends at ", b);
+  }
+  if (b > s->len) panic_range("range end index ", b, " out of range for slice of length ", s->len);
+  return slice_view(s->data + a, b - a);
+}
+INTRINSIC(slice__to_array) {
+  const Vec *s = (const Vec *)A(0);
+  Vec *v = vec_new(s->len);
+  for (u64 i = 0; i < s->len; i++) vec_push(v, s->data[i]);
+  return (V)v;
+}
+INTRINSIC(slice__swap) {
+  Vec *s = (Vec *)A(0);
+  u64 a = A(1), b = A(2);
+  if (a >= s->len) rt_index_fail(s->len, a);
+  if (b >= s->len) rt_index_fail(s->len, b);
+  V t = s->data[a]; s->data[a] = s->data[b]; s->data[b] = t;
+  return 0;
+}
+INTRINSIC(slice__as_ptr) { return (V)((const Vec *)A(0))->data; }
+INTRINSIC(slice__as_mut_ptr) { return (V)((const Vec *)A(0))->data; }
+INTRINSIC(slice__from_raw_parts) { return slice_view((V *)A(0), A(1)); }
+INTRINSIC(slice__from_raw_parts_mut) { return slice_view((V *)A(0), A(1)); }
+INTRINSIC(array__into_vec) { return A(0); }
+INTRINSIC(array__from_vec) { return A(0); }
+INTRINSIC(array__as_ptr) { return (V)(*(Vec **)A(0))->data; }
+
+INTRINSIC(ptr__null) { UNUSED; return 0; }
+INTRINSIC(ptr__null_mut) { UNUSED; return 0; }
+INTRINSIC(ptr__is_null) { return A(0) == 0; }
+INTRINSIC(ptr__offset) { return A(0) + 8 * A(1); }
+INTRINSIC(ptr__read) {
+  if (!A(0)) rt_panic_cstr("null pointer dereference occurred");
+  return *(V *)A(0);
+}
+INTRINSIC(ptr__write) { *(V *)A(0) = A(1); return 0; }
+INTRINSIC(ptr__addr) { return A(0); }
+INTRINSIC(ptr__from_addr) { return A(0); }
+
+static V conjure(V td) {
+  const u32 *t = rt_type(td);
+  switch (t[0]) {
+    case T_UNIT: return 0;
+    case T_TUPLE: { V a = agg_new(0, t[1]); for (u32 i = 0; i < t[1]; i++) ((Agg *)a)->f[i] = conjure(t[2 + i]); return a; }
+    case T_STRUCT: { V a = agg_new(0, t[3]); for (u32 i = 0; i < t[3]; i++) ((Agg *)a)->f[i] = conjure(t[5 + 2 * i]); return a; }
+    case T_VEC: return (V)vec_new(0);
+    default: rt_panic_cstr("mem::conjure_zst invoked on a non-zero-sized type");
+  }
+}
+INTRINSIC(mem__conjure_zst) { return conjure(A(0)); }
+
+/* `static` items live in pages of slots, allocated on first use. */
+static V *global_pages[256];
+EXPORT V rt_global(V index) {
+  V **page = &global_pages[index >> 8];
+  if (!*page) *page = rt_alloc(256 * sizeof(V));
+  return (V)(*page + (index & 255));
+}
 
 /* ------------------------------------------------------------------------ */
 /* String and str                                                            */
@@ -315,6 +401,23 @@ INTRINSIC(str__repeat) {
   StringBuf *b = sb_new();
   for (u64 i = 0; i < A(1); i++) sb_push(b, s->ptr, s->len);
   return (V)b;
+}
+INTRINSIC(str__prev_char) {
+  const Str *s = S(0);
+  V *pos = (V *)A(1);
+  u64 i = *pos;
+  if (i == 0) return none();
+  do i--; while (i > 0 && (s->ptr[i] & 0xC0) == 0x80);
+  u64 j = i;
+  u32 c = utf8_next(s->ptr, s->len, &j);
+  *pos = i;
+  return some(c);
+}
+INTRINSIC(str__as_bytes) {
+  const Str *s = S(0);
+  Vec *v = vec_new(s->len);
+  for (u64 i = 0; i < s->len; i++) vec_push(v, s->ptr[i]);
+  return slice_view(v->data, v->len);
 }
 INTRINSIC(str__slice) {
   const Str *s = S(0);

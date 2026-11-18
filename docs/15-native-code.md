@@ -81,7 +81,11 @@ The VM gives each value one operand-stack slot, whatever its type. The native ba
 | `&T`, `&mut T` | the address of the 64-bit slot that holds the `T` |
 | `&str` | pointer to `Str { len, ptr }` |
 | `String` | pointer to `StringBuf { len, ptr, cap }` |
-| `Vec<T>` | pointer to `Vec { len, data, cap }` |
+| `Vec<T>`, `[T; N]` | pointer to `Vec { len, data, cap }` |
+| `&[T]`, `&mut [T]` | pointer to `Vec { len, first element, 0 }` |
+| `*const T`, `*mut T` | like `&T` |
+| closure | pointer to an `Agg` of its captures |
+| `fn` pointer | the code address |
 | `Box<T>` | pointer to one 64-bit cell |
 | struct, tuple, enum | pointer to `Agg { u32 tag, u32 n, V fields[n] }` |
 | `HashMap<K, V>` | pointer to a `Map` |

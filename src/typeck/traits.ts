@@ -51,13 +51,13 @@ const MAX_DEPTH = 24;
 const PRIM_TRAITS: Record<string, (t: Ty) => boolean> = {
   Copy: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "never",
   Clone: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "never",
-  Debug: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str",
-  Display: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str",
-  PartialEq: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str",
-  Eq: (t) => t.k === "int" || t.k === "bool" || t.k === "char" || t.k === "str",
-  PartialOrd: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str",
-  Ord: (t) => t.k === "int" || t.k === "bool" || t.k === "char" || t.k === "str",
-  Hash: (t) => t.k === "int" || t.k === "bool" || t.k === "char" || t.k === "str",
+  Debug: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
+  Display: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
+  PartialEq: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
+  Eq: (t) => t.k === "int" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
+  PartialOrd: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
+  Ord: (t) => t.k === "int" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
+  Hash: (t) => t.k === "int" || t.k === "bool" || t.k === "char" || t.k === "str" || t.k === "never",
   Default: (t) => t.k === "int" || t.k === "float" || t.k === "bool" || t.k === "char",
 };
 
@@ -68,7 +68,12 @@ const REF_FORWARDING = new Set(["Debug", "Display", "PartialEq", "Eq", "PartialO
 /** `String` is native, so its comparison and formatting traits are too. */
 const STRING_TRAITS = new Set(["Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash"]);
 
+const SEQ_TRAITS = new Set(["Debug", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash"]);
+const PTR_TRAITS = new Set(["Copy", "Clone", "Debug", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash"]);
+
 export class TraitSolver {
+  /** After type checking, `impl Trait` is replaced by the type it hides. */
+  reveal = false;
   private readonly tcx: TyCtxt;
   private readonly infcx: InferCtxt;
   /** Where-clauses in scope, elaborated with supertraits. */
@@ -116,14 +121,29 @@ export class TraitSolver {
     if (depth > MAX_DEPTH) return { kind: "ambiguous" };
     self = this.infcx.shallow(self);
     if (self.k === "error") return { kind: "builtin" };
-    if (self.k === "never") return { kind: "builtin" };
+    if (self.k === "opaque" && this.reveal) {
+      const hidden = this.revealOpaque(self);
+      if (hidden) return this.select(hidden, trait, args, depth + 1);
+    }
 
-    // 1. Where-clauses in scope.
+    // 1. Where-clauses in scope. An unknown type must not be guessed from them.
     for (const p of this.env) {
-      if (p.kind !== "trait" || p.trait !== trait) continue;
+      if (p.kind !== "trait" || p.trait !== trait || self.k === "var") continue;
       const snap = this.infcx.snapshot();
       if (this.infcx.unify(p.self, self) && p.args.every((a, i) => this.infcx.unify(a, args[i]))) return { kind: "param" };
       this.infcx.rollback(snap);
+    }
+    // The bounds written on an `impl Trait` are all that callers may rely on.
+    if (self.k === "opaque") {
+      for (const p of this.tcx.opaquePredicates(self)) {
+        if (p.kind !== "trait") continue;
+        for (const tr of this.elaborate({ trait: p.trait, args: p.args }, self)) {
+          if (tr.trait !== trait) continue;
+          const snap = this.infcx.snapshot();
+          if (tr.args.every((a, i) => this.infcx.unify(a, args[i]))) return { kind: "param" };
+          this.infcx.rollback(snap);
+        }
+      }
     }
 
     const name = this.langNames.get(trait);
@@ -136,7 +156,7 @@ export class TraitSolver {
 
     // 2. Built-in impls.
     if (name) {
-      const builtin = this.builtin(name, self, trait, depth);
+      const builtin = this.builtin(name, self, trait, depth, args);
       if (builtin) return builtin;
     }
 
@@ -203,20 +223,56 @@ export class TraitSolver {
     let result: "ok" | "ambiguous" = "ok";
     for (const p of this.tcx.predicates(impl)) {
       if (p.kind === "trait") {
-        const r = this.select(substitute(p.self, subst), p.trait, p.args.map((a) => substitute(a, subst)), depth + 1);
+        const inst = (t: Ty) => this.normalizeDeep(substitute(t, subst), () => undefined, depth + 1);
+        const r = this.select(inst(p.self), p.trait, p.args.map(inst), depth + 1);
         if (r.kind === "none") return "none";
         if (r.kind === "ambiguous") result = "ambiguous";
       } else {
-        const proj: Ty = { k: "proj", trait: p.trait, traitArgs: p.traitArgs.map((a) => substitute(a, subst)), self: substitute(p.self, subst), name: p.name };
+        const inst = (t: Ty) => this.normalizeDeep(substitute(t, subst), () => undefined, depth + 1);
+        const proj: Extract<Ty, { k: "proj" }> = { k: "proj", trait: p.trait, traitArgs: p.traitArgs.map(inst), self: inst(p.self), name: p.name };
         const n = this.normalize(proj, depth + 1);
         if (n === undefined) result = "ambiguous";
-        else if (!this.infcx.unify(n, substitute(p.ty, subst))) return "none";
+        else if (!this.infcx.unify(n, inst(p.ty))) return "none";
       }
     }
     return result;
   }
 
-  private builtin(name: string, self: Ty, trait: DefId, depth: number): Selection | undefined {
+  private revealOpaque(t: Extract<Ty, { k: "opaque" }>): Ty | undefined {
+    const o = this.tcx.opaques.get(t.index);
+    if (!o?.hidden) return undefined;
+    return substitute(o.hidden, new Map(this.tcx.allParams(o.owner).map((p, i) => [p, t.args[i]])));
+  }
+
+  private builtin(name: string, self: Ty, trait: DefId, depth: number, args: Ty[]): Selection | undefined {
+    if (name === "Fn" || name === "FnMut" || name === "FnOnce") {
+      const sig = this.tcx.callableSig(self);
+      if (sig) {
+        const params = sig.params.map((p) => this.normalizeDeep(p, () => undefined, depth + 1));
+        return this.infcx.unify(args[0], { k: "tuple", elems: params }) ? { kind: "builtin" } : { kind: "none" };
+      }
+      // `&F` is callable when `F: Fn`, `&mut F` when `F: FnMut`, and `Box<F>` like `F`.
+      if (self.k === "ref") {
+        if (self.mutable && name === "Fn") return { kind: "none" };
+        return this.select(self.inner, this.tcx.lang(self.mutable ? "FnMut" : "Fn"), args, depth + 1);
+      }
+      if (self.k === "adt" && this.tcx.isLang(self.def, "Box")) return this.select(self.args[0], trait, args, depth + 1);
+      return undefined;
+    }
+    if (self.k === "array") {
+      if (name === "Copy" || name === "Clone" || name === "Default" || SEQ_TRAITS.has(name)) return this.all([self.elem], trait, depth);
+    }
+    if (self.k === "slice" && SEQ_TRAITS.has(name)) return this.all([self.elem], trait, depth);
+    if (self.k === "ptr" && PTR_TRAITS.has(name)) return { kind: "builtin" };
+    if (self.k === "fnptr" && PTR_TRAITS.has(name)) return { kind: "builtin" };
+    if (self.k === "fndef" && (name === "Copy" || name === "Clone")) return { kind: "builtin" };
+    if (self.k === "closure" && (name === "Copy" || name === "Clone")) {
+      const caps = this.tcx.closures.get(self.id)?.captures;
+      if (!caps) return { kind: "builtin" }; // not analyzed yet; codegen and borrowck ask again later
+      if (caps.some((c) => c.by === "mut")) return { kind: "none" };
+      const subst = new Map(this.tcx.allParams(this.tcx.closures.get(self.id)!.owner).map((p, i) => [p, self.args[i]]));
+      return this.all(caps.filter((c) => !c.by).map((c) => substitute(c.ty, subst)), trait, depth);
+    }
     if (PRIM_TRAITS[name]?.(self)) return { kind: "builtin" };
     if (self.k === "tuple" && STRUCTURAL_TRAITS.has(name)) return this.all(self.elems, trait, depth);
     if (self.k === "ref") {
@@ -225,6 +281,7 @@ export class TraitSolver {
     }
     if (self.k === "adt") {
       if (this.tcx.isLang(self.def, "String") && STRING_TRAITS.has(name)) return { kind: "builtin" };
+      if (this.tcx.isLang(self.def, "Vec") && ["PartialOrd", "Ord", "Hash"].includes(name)) return this.all(self.args, trait, depth);
       if (this.tcx.isLang(self.def, "Box") && ["Debug", "PartialEq", "Eq", "PartialOrd", "Ord"].includes(name)) return this.all(self.args, trait, depth);
     }
     return undefined;
@@ -249,16 +306,37 @@ export class TraitSolver {
     const self = this.infcx.shallow(t.self);
     // A binding from the environment (`I: Iterator<Item = u8>`) wins.
     for (const p of this.env) {
-      if (p.kind !== "proj" || p.trait !== t.trait || p.name !== t.name) continue;
+      if (p.kind !== "proj" || p.trait !== t.trait || p.name !== t.name || self.k === "var") continue;
       const snap = this.infcx.snapshot();
       if (this.infcx.unify(p.self, self) && p.traitArgs.every((a, i) => this.infcx.unify(a, t.traitArgs[i]))) return p.ty;
       this.infcx.rollback(snap);
     }
     if (self.k === "var") return undefined;
+    if (self.k === "opaque") {
+      if (this.reveal) {
+        const hidden = this.revealOpaque(self);
+        if (hidden) return this.normalize({ ...t, self: hidden }, depth + 1);
+      }
+      for (const p of this.tcx.opaquePredicates(self)) {
+        if (p.kind !== "proj" || p.trait !== t.trait || p.name !== t.name) continue;
+        const snap = this.infcx.snapshot();
+        if (p.traitArgs.every((a, i) => this.infcx.unify(a, t.traitArgs[i]))) return p.ty;
+        this.infcx.rollback(snap);
+      }
+    }
+    if (t.name === "Output" && this.tcx.isLang(t.trait, "FnOnce")) {
+      const sig = this.tcx.callableSig(self);
+      if (sig) {
+        if (!this.infcx.unify(t.traitArgs[0], { k: "tuple", elems: sig.params.map((p) => this.normalizeDeep(p, () => undefined, depth + 1)) })) return undefined;
+        return this.normalizeDeep(sig.ret, () => undefined, depth + 1);
+      }
+      if (self.k === "ref") return this.normalize({ ...t, self: self.inner }, depth + 1);
+      if (self.k === "adt" && this.tcx.isLang(self.def, "Box")) return this.normalize({ ...t, self: self.args[0] }, depth + 1);
+    }
     const sel = this.select(self, t.trait, t.traitArgs, depth);
     // A generic param proven by a where-clause stays a *rigid* projection: `I::Item` is
     // an opaque type inside the function. But a blanket impl can still normalize it.
-    if (sel.kind !== "impl" && (self.k === "param" || self.k === "proj")) return { ...t, self };
+    if (sel.kind !== "impl" && (self.k === "param" || self.k === "proj" || self.k === "opaque")) return { ...t, self };
     if (sel.kind === "impl") {
       const raw = this.tcx.implAssocType(sel.impl, t.name);
       if (!raw) return undefined;
@@ -275,6 +353,10 @@ export class TraitSolver {
   normalizeDeep(t: Ty, onStuck: (p: Extract<Ty, { k: "proj" }>) => Ty | undefined, depth = 0): Ty {
     const go = (t: Ty): Ty => {
       t = this.infcx.shallow(t);
+      if (t.k === "opaque" && this.reveal) {
+        const hidden = this.revealOpaque(t);
+        if (hidden) return go(hidden);
+      }
       if (t.k === "proj") {
         const inner = { ...t, self: go(t.self), traitArgs: t.traitArgs.map(go) };
         const n = this.normalize(inner, depth);

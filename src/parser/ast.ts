@@ -56,7 +56,19 @@ export type TypeExpr =
   /** `<T as Iterator>::Item` — a qualified path to an associated type. */
   | ({ kind: "qpath"; self: TypeExpr; trait: Path; name: string } & Node)
   | ({ kind: "infer" } & Node)
-  | ({ kind: "never" } & Node);
+  | ({ kind: "never" } & Node)
+  /** `*const T` / `*mut T` */
+  | ({ kind: "ptr"; mutable: boolean; inner: TypeExpr } & Node)
+  /** `[T]` */
+  | ({ kind: "slice"; elem: TypeExpr } & Node)
+  /** `[T; N]`. `len` is absent for `[T; _]`. */
+  | ({ kind: "array"; elem: TypeExpr; len?: Expr } & Node)
+  /** `fn(A, B) -> C` */
+  | ({ kind: "fnptr"; params: TypeExpr[]; ret?: TypeExpr; isUnsafe: boolean } & Node)
+  /** `impl Trait` in return position. In argument position the parser turns it into a generic parameter. */
+  | ({ kind: "implTrait"; bounds: Path[]; lifetimes: string[] } & Node)
+  /** A constant used as a generic argument: `Foo<3>`, `Foo<{ N + 1 }>`. */
+  | ({ kind: "constArg"; value: Expr } & Node);
 
 // ---------------------------------------------------------------------------
 // Items: the things that live at module level
@@ -68,12 +80,16 @@ export interface GenericParam {
   bounds: Path[];
   /** Default type, as in `trait Add<Rhs = Self>`. */
   default?: TypeExpr;
+  /** `const N: usize`: the parameter is a value of this type. */
+  constTy?: TypeExpr;
   span: Span;
 }
 
 export interface Generics {
   lifetimes: string[];
   params: GenericParam[];
+  /** `where` clauses on anything but a plain parameter: `Self: Sized`, `T::Item: Ord`. */
+  where?: { ty: TypeExpr; bounds: Path[] }[];
 }
 
 export type SelfParamKind = "value" | "ref" | "refMut";
@@ -95,6 +111,7 @@ export interface FnItem extends Node {
   ret?: TypeExpr;
   /** Absent for a trait method declaration without a default body. */
   body?: BlockExpr;
+  isUnsafe: boolean;
 }
 
 export type FieldsKind = "named" | "tuple" | "unit";
@@ -141,6 +158,7 @@ export interface ImplItem extends Node {
   traitPath?: Path;
   selfTy: TypeExpr;
   items: FnItem[];
+  isUnsafe: boolean;
   /** `type Item = u32;` inside a trait impl. */
   assocTypes: TypeAliasItem[];
   /** `const MAX: i32 = ...;` inside an inherent impl. */
@@ -155,6 +173,7 @@ export interface TraitItem extends Node {
   generics: Generics;
   /** `trait Ord: Eq + PartialOrd` — implementing `Ord` requires the supertraits too. */
   supertraits: Path[];
+  isUnsafe: boolean;
   items: FnItem[];
   /** `type Item;` declarations: associated types the implementor must provide. */
   assocTypes: TypeAliasItem[];
@@ -199,6 +218,10 @@ export interface ConstItem extends Node {
   isPub: boolean;
   ty: TypeExpr;
   value: Expr;
+  /** `static` rather than `const`: one storage location, shared by every use. */
+  isStatic?: boolean;
+  /** `static mut`. */
+  mutable?: boolean;
 }
 
 export type Item = FnItem | StructItem | EnumItem | ImplItem | TraitItem | ModItem | UseItem | ConstItem | TypeAliasItem;
@@ -218,7 +241,10 @@ export type Pattern =
   | ({ kind: "tupleStruct"; path: Path; elems: Pattern[] } & Node)
   | ({ kind: "struct"; path: Path; fields: { name: string; pat: Pattern; span: Span }[]; rest: boolean } & Node)
   | ({ kind: "ref"; mutable: boolean; inner: Pattern } & Node)
-  | ({ kind: "or"; alts: Pattern[] } & Node);
+  | ({ kind: "or"; alts: Pattern[] } & Node)
+  /** `[a, b, .., z]`. A `..` element is a `rest` pattern, possibly bound: `tail @ ..`. */
+  | ({ kind: "slice"; elems: Pattern[] } & Node)
+  | ({ kind: "rest" } & Node);
 
 // ---------------------------------------------------------------------------
 // Expressions
@@ -256,6 +282,13 @@ export interface BlockExpr extends Node {
   stmts: Stmt[];
   /** The final expression without a semicolon: the block's value. */
   tail?: Expr;
+  /** `unsafe { .. }` */
+  isUnsafe?: boolean;
+}
+
+export interface ClosureParam {
+  pat: Pattern;
+  ty?: TypeExpr;
 }
 
 export interface MatchArm {
@@ -269,7 +302,8 @@ export type Expr =
   | ({ kind: "lit"; value: Literal } & Node)
   | ({ kind: "path"; path: Path } & Node)
   | ({ kind: "unary"; op: "-" | "!" | "*"; expr: Expr } & Node)
-  | ({ kind: "ref"; mutable: boolean; expr: Expr } & Node)
+  /** `&x`, `&mut x`, or with `raw` set, `&raw const x` / `&raw mut x`. */
+  | ({ kind: "ref"; mutable: boolean; expr: Expr; raw?: boolean } & Node)
   | ({ kind: "binary"; op: BinaryOp; left: Expr; right: Expr } & Node)
   | ({ kind: "assign"; op: AssignOp; target: Expr; value: Expr } & Node)
   | ({ kind: "call"; callee: Expr; args: Expr[] } & Node)
@@ -278,6 +312,12 @@ export type Expr =
   | ({ kind: "index"; expr: Expr; index: Expr } & Node)
   | ({ kind: "structLit"; path: Path; fields: { name: string; value: Expr; span: Span }[]; base?: Expr } & Node)
   | ({ kind: "tuple"; elems: Expr[] } & Node)
+  /** `[a, b, c]` */
+  | ({ kind: "array"; elems: Expr[] } & Node)
+  /** `[value; len]` */
+  | ({ kind: "repeat"; value: Expr; len: Expr } & Node)
+  /** `|a, b| body` or `move |a| body` */
+  | ({ kind: "closure"; params: ClosureParam[]; ret?: TypeExpr; body: Expr; isMove: boolean } & Node)
   | BlockExpr
   | ({ kind: "if"; cond: Expr; then: BlockExpr; else?: Expr } & Node)
   | ({ kind: "while"; label?: string; cond: Expr; body: BlockExpr } & Node)

@@ -9,6 +9,17 @@ pub struct Box<T>;
 
 impl<T> Box<T> {
     pub fn new(value: T) -> Box<T>;
+    pub fn into_raw(b: Box<T>) -> *mut T;
+    pub unsafe fn from_raw(raw: *mut T) -> Box<T>;
+
+    pub fn leak<'a>(b: Box<T>) -> &'a mut T {
+        unsafe { &mut *Box::into_raw(b) }
+    }
+
+    /// Apply `f` to the boxed value, keeping the result in a box.
+    pub fn map<U, F: FnOnce(T) -> U>(this: Box<T>, f: F) -> Box<U> {
+        Box::new(f(*this))
+    }
 }
 
 impl<T: Clone> Clone for Box<T> {

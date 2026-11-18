@@ -56,6 +56,21 @@ impl<'a, K: Hash + Eq, V> Entry<'a, K, V> {
     pub fn or_insert(self, default: V) -> &'a mut V {
         entry_ref(self.map, self.key, default)
     }
+
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+        if self.map.contains_key(&self.key) {
+            self.map.get_mut(&self.key).unwrap()
+        } else {
+            entry_ref(self.map, self.key, default())
+        }
+    }
+
+    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Entry<'a, K, V> {
+        if let Some(v) = self.map.get_mut(&self.key) {
+            f(v);
+        }
+        self
+    }
 }
 
 impl<'a, K: Hash + Eq, V: Default> Entry<'a, K, V> {
@@ -129,6 +144,28 @@ impl<'a, K, V> IntoIterator for &'a HashMap<K, V> {
     type IntoIter = Iter<'a, K, V>;
     fn into_iter(self) -> Iter<'a, K, V> {
         Iter { map: self, pos: 0 }
+    }
+}
+
+impl<K: Hash + Eq, V> crate::iter::FromIterator<(K, V)> for HashMap<K, V> {
+    fn from_iter<I: Iterator<Item = (K, V)>>(iter: I) -> HashMap<K, V> {
+        let mut map = HashMap::new();
+        for (k, v) in iter {
+            map.insert(k, v);
+        }
+        map
+    }
+}
+
+impl<K: Hash + Eq, V> crate::iter::Extend<(K, V)> for HashMap<K, V> {
+    fn extend_one(&mut self, item: (K, V)) {
+        self.insert(item.0, item.1);
+    }
+}
+
+impl<K: Hash + Eq, V> Default for HashMap<K, V> {
+    fn default() -> HashMap<K, V> {
+        HashMap::new()
     }
 }
 

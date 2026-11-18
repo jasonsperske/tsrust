@@ -86,7 +86,7 @@ const align = (n: number, a: number) => Math.ceil(n / a) * a;
 const PANIC = { add: 0, sub: 1, mul: 2, div: 3, rem: 4, neg: 5, shl: 6, shr: 7, divZero: 8, remZero: 9, unreachable: 10 } as const;
 
 /** Type descriptor kind codes; must match native/runtime/runtime.h. */
-const T = { int: 0, float: 1, bool: 2, char: 3, str: 4, string: 5, unit: 6, never: 7, tuple: 8, ref: 9, box: 10, vec: 11, map: 12, struct: 13, enum: 14, opaque: 15 };
+const T = { int: 0, float: 1, bool: 2, char: 3, str: 4, string: 5, unit: 6, never: 7, tuple: 8, ref: 9, box: 10, vec: 11, map: 12, struct: 13, enum: 14, opaque: 15, ptr: 16, slice: 17 };
 const FIELDS_KIND = { named: 0, tuple: 1, unit: 2 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +180,8 @@ function encodeTypes(types: TypeDesc[], data: DataBuilder): { offsets: number[];
       case "ref": words.push(T.ref, t.inner); break;
       case "box": words.push(T.box, t.inner); break;
       case "vec": words.push(T.vec, t.elem); break;
+      case "slice": words.push(T.slice, t.elem); break;
+      case "ptr": words.push(T.ptr); break;
       case "map": words.push(T.map, t.key, t.value); break;
       case "struct": words.push(T.struct, data.name(t.name), FIELDS_KIND[t.kind], t.fields.length, ...fields(t.fields)); break;
       case "enum":
@@ -406,6 +408,19 @@ class Translator {
         else a.pushMem(R.rax, 0);
         return;
       }
+
+      // A slice has the layout of a Vec, so indexing needs no special case.
+      case Op.AS_SLICE: this.rtCall("rt_as_slice", { sp: true, pop: 1, push: true }); return;
+      case Op.REF_SLICE: a.pop(R.rax); a.pushMem(R.rax, 0); this.rtCall("rt_as_slice", { sp: true, pop: 1, push: true }); return;
+      case Op.FN_PTR: a.leaRip(R.rax, this.fnLabels[x]); a.push(R.rax); return;
+      case Op.CALL_PTR:
+        a.load(R.rax, R.rsp, 8 * x);
+        a.callRax();
+        a.addImm(R.rsp, 8 * (x + 1));
+        a.push(R.rax);
+        restoreLoc();
+        return;
+      case Op.GLOBAL_REF: this.rtCall("rt_global", { regs: [x], push: true }); return;
 
       case Op.MAKE_AGG: this.rtCall("rt_make_agg", { sp: true, regs: [x, y], pop: y, push: true }); return;
       case Op.GET_FIELD: a.pop(R.rax); a.pushMem(R.rax, 8 + 8 * x); return;

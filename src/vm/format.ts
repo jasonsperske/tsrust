@@ -7,7 +7,7 @@
  * TSRust's output with real `rustc` output.
  */
 import type { TypeDesc } from "../bytecode/program.ts";
-import { Agg, Ref, RMap, RString, RVec, type Value } from "./values.ts";
+import { Agg, Ref, RMap, RString, seqItems, type Value } from "./values.ts";
 
 /** Rust prints floats without an exponent and with the shortest round-tripping digits. */
 function plainNumber(n: number): string {
@@ -102,10 +102,9 @@ export class Formatter {
         if (items.length === 1 && !pretty) return `(${items[0]},)`;
         return list("(", ")", items);
       }
-      case "vec": {
-        const vec = v as RVec;
-        return list("[", "]", vec.items.map((x) => this.debug(x, t.elem, pretty, inner, precision)));
-      }
+      case "vec": case "slice":
+        return list("[", "]", seqItems(v).map((x) => this.debug(x, t.elem, pretty, inner, precision)));
+      case "ptr": return "0x1000";
       case "map": {
         const m = v as RMap;
         const items: string[] = [];

@@ -30,6 +30,13 @@
  *
  * Types with infinitely many values (integers, strings) have no finite list
  * of constructors; for them only a wildcard (or binding) covers "the rest".
+ *
+ * ## Empty types
+ *
+ * A type with no values, such as `!`, `enum Void {}`, `(i32, !)` or a struct
+ * with a `!` field, has no constructors to cover, so `let Ok(v) = r;` is
+ * irrefutable for `r: Result<T, !>`. The exception is data behind a reference:
+ * unsafe code could have produced a `&!`, so those cases must still be written.
  */
 import type { Diagnostics } from "../diagnostics.ts";
 import type * as A from "../parser/ast.ts";
@@ -43,19 +50,33 @@ type Ctor =
   | { kind: "bool"; value: boolean }
   | { kind: "range"; lo: number; hi: number } // ints and chars (as code points)
   | { kind: "str"; value: string }
+  /** A sequence: exactly `prefix` elements, or with `varlen`, `prefix` + any number + `suffix`. */
+  | { kind: "slice"; prefix: number; suffix: number; varlen: boolean }
   | { kind: "opaque" }; // matches nothing we can reason about (floats, consts)
 
-type DPat = { kind: "wild"; ty: Ty } | { kind: "ctor"; ctor: Ctor; fields: DPat[]; ty: Ty } | { kind: "or"; alts: DPat[]; ty: Ty };
+/** `behindRef`: reached through a reference, so empty types can't be assumed empty. */
+type DPat = ({ kind: "wild"; ty: Ty } | { kind: "ctor"; ctor: Ctor; fields: DPat[]; ty: Ty } | { kind: "or"; alts: DPat[]; ty: Ty }) & { behindRef?: boolean };
+
+/** `..` or `name @ ..` inside a slice pattern. */
+export function isRestPat(p: A.Pattern): boolean {
+  return p.kind === "rest" || (p.kind === "ident" && p.sub?.kind === "rest");
+}
 
 export class ExhaustivenessChecker {
   private readonly tcx: TyCtxt;
   private readonly r: TypeckResults;
   private readonly diags: Diagnostics;
+  /** The function being checked: private fields are only known to be empty from inside their module. */
+  private body: number | undefined;
 
   constructor(tcx: TyCtxt, r: TypeckResults, diags: Diagnostics) {
     this.tcx = tcx;
     this.r = r;
     this.diags = diags;
+  }
+
+  enterBody(def: number) {
+    this.body = def;
   }
 
   /** Check a `match` expression: exhaustive arms, and no unreachable ones. */
@@ -137,6 +158,20 @@ export class ExhaustivenessChecker {
       }
       case "ref": return { kind: "ctor", ctor: { kind: "single" }, fields: [this.lower(p.inner, ty.k === "ref" ? ty.inner : ty)], ty };
       case "or": return { kind: "or", alts: p.alts.map((a) => this.lower(a, ty)), ty };
+      case "rest": return wild;
+      case "slice": {
+        const elem = ty.k === "array" ? ty.elem : ty.k === "slice" ? ty.elem : ty;
+        const at = p.elems.findIndex(isRestPat);
+        const low = (xs: A.Pattern[]) => xs.map((x) => this.lower(x, elem));
+        if (at < 0) return { kind: "ctor", ctor: { kind: "slice", prefix: p.elems.length, suffix: 0, varlen: false }, fields: low(p.elems), ty };
+        const before = low(p.elems.slice(0, at)), after = low(p.elems.slice(at + 1));
+        if (ty.k === "array" && ty.len.k === "constval") {
+          // An array's length is known, so `..` just stands for wildcards.
+          const middle = Array.from({ length: Math.max(0, ty.len.n - before.length - after.length) }, (): DPat => ({ kind: "wild", ty: elem }));
+          return { kind: "ctor", ctor: { kind: "slice", prefix: ty.len.n, suffix: 0, varlen: false }, fields: [...before, ...middle, ...after], ty };
+        }
+        return { kind: "ctor", ctor: { kind: "slice", prefix: before.length, suffix: after.length, varlen: true }, fields: [...before, ...after], ty };
+      }
       case "path": return this.lowerCtorRef(p, ty, []);
       case "tupleStruct": return this.lowerCtorRef(p, ty, p.elems.map((x, i) => ({ index: i, pat: x })));
       case "struct": return this.lowerCtorRef(p, ty, p.fields.map((f) => ({ index: this.r.fieldIndices.get(f.pat.id) ?? -1, pat: f.pat })));
@@ -175,22 +210,73 @@ export class ExhaustivenessChecker {
   // -------------------------------------------------------------------------
 
   /** All constructors of `ty`, or `undefined` if there are infinitely many. */
-  private allCtors(ty: Ty): Ctor[] | undefined {
+  private allCtors(ty: Ty, behindRef = false): Ctor[] | undefined {
+    if (!behindRef && !this.inhabited(ty)) return [];
     switch (ty.k) {
       case "bool": return [{ kind: "bool", value: false }, { kind: "bool", value: true }];
       case "tuple": case "ref": return [{ kind: "single" }];
-      case "never": return [];
+      case "array": return ty.len.k === "constval" ? [{ kind: "slice", prefix: ty.len.n, suffix: 0, varlen: false }] : [{ kind: "slice", prefix: 0, suffix: 0, varlen: true }];
       case "adt": {
         if (this.tcx.isNativeAdt(ty.def)) return undefined;
         const d = this.tcx.defs[ty.def];
         if (d.kind === "struct") return [{ kind: "single" }];
-        return this.tcx.variants(ty.def).map((_, i) => ({ kind: "variant", index: i }));
+        const all = this.tcx.variants(ty.def).map((v, i) => ({ v, ctor: { kind: "variant", index: i } as Ctor }));
+        // An empty enum behind a reference still needs a `_` arm.
+        if (behindRef) return all.length ? all.map((x) => x.ctor) : undefined;
+        return all.filter(({ v }) => this.fieldTys(ty, v.def).every((t) => this.inhabited(t))).map((x) => x.ctor);
       }
       default: return undefined;
     }
   }
 
+  /** Could a value of `ty` exist? References and library types always count as inhabited. */
+  private inhabited(ty: Ty, seen: string[] = []): boolean {
+    if (ty.k === "never") return false;
+    if (ty.k === "tuple") return ty.elems.every((t) => this.inhabited(t, seen));
+    if (ty.k !== "adt" || this.tcx.isNativeAdt(ty.def)) return true;
+    const key = JSON.stringify(ty);
+    if (seen.includes(key)) return true;
+    const next = [...seen, key];
+    const isStruct = this.tcx.defs[ty.def].kind === "struct";
+    const variants = this.tcx.variants(ty.def);
+    if (isStruct && !this.privateFieldsVisible(ty.def)) {
+      const tys = this.fieldTys(ty, variants[0].def);
+      return variants[0].fields.every((f, i) => !f.isPub || this.inhabited(tys[i], next));
+    }
+    return variants.some((v) => this.fieldTys(ty, v.def).every((t) => this.inhabited(t, next)));
+  }
+
+  private privateFieldsVisible(def: number): boolean {
+    const owner = this.tcx.defs[def].module;
+    let m: number | undefined = this.body === undefined ? undefined : this.tcx.defs[this.body].module;
+    for (; m !== undefined; m = this.tcx.defs[m].parent) if (m === owner) return true;
+    return false;
+  }
+
+  /** The same pattern, seen through a reference. */
+  private behind(p: DPat): DPat {
+    if (p.kind === "ctor") return { ...p, behindRef: true, fields: p.fields.map((f) => this.behind(f)) };
+    if (p.kind === "or") return { ...p, behindRef: true, alts: p.alts.map((a) => this.behind(a)) };
+    return { ...p, behindRef: true };
+  }
+
+  /** The lengths worth distinguishing for a slice, given the patterns in this column. */
+  private sliceCtors(present: Ctor[]): Ctor[] {
+    let prefix = 0, suffix = 0, fixed = -1;
+    for (const c of present) {
+      if (c.kind !== "slice") continue;
+      if (c.varlen) { prefix = Math.max(prefix, c.prefix); suffix = Math.max(suffix, c.suffix); }
+      else fixed = Math.max(fixed, c.prefix);
+    }
+    if (fixed + 1 > prefix + suffix) prefix = fixed + 1 - suffix;
+    const out: Ctor[] = [];
+    for (let n = 0; n < prefix + suffix; n++) out.push({ kind: "slice", prefix: n, suffix: 0, varlen: false });
+    out.push({ kind: "slice", prefix, suffix, varlen: true });
+    return out;
+  }
+
   private fieldTys(ty: Ty, variantDef?: number, ctor?: Ctor): Ty[] {
+    if ((ty.k === "array" || ty.k === "slice") && ctor?.kind === "slice") return Array.from({ length: ctor.prefix + ctor.suffix }, () => ty.elem);
     if (ty.k === "tuple") return ty.elems;
     if (ty.k === "ref") return [ty.inner];
     if (ty.k === "adt" && !this.tcx.isNativeAdt(ty.def)) {
@@ -210,6 +296,7 @@ export class ExhaustivenessChecker {
       case "bool": return a.value === (b as typeof a).value;
       case "range": return a.lo === (b as typeof a).lo && a.hi === (b as typeof a).hi;
       case "str": return a.value === (b as typeof a).value;
+      case "slice": return a.prefix === (b as typeof a).prefix && a.suffix === (b as typeof a).suffix && a.varlen === (b as typeof a).varlen;
       case "single": return true;
       case "opaque": return false;
     }
@@ -218,6 +305,10 @@ export class ExhaustivenessChecker {
   /** Does a row whose head is `rowCtor` match every value of `c`? */
   private covers(rowCtor: Ctor, c: Ctor): boolean {
     if (rowCtor.kind === "range" && c.kind === "range") return rowCtor.lo <= c.lo && c.hi <= rowCtor.hi;
+    if (rowCtor.kind === "slice" && c.kind === "slice") {
+      if (!rowCtor.varlen) return !c.varlen && rowCtor.prefix === c.prefix;
+      return c.prefix + c.suffix >= rowCtor.prefix + rowCtor.suffix;
+    }
     return this.sameCtor(rowCtor, c);
   }
 
@@ -242,7 +333,16 @@ export class ExhaustivenessChecker {
     for (const row of rows) {
       const head = row[0];
       if (head.kind === "wild") out.push([...fieldTys.slice(0, arity).map((t): DPat => ({ kind: "wild", ty: t })), ...row.slice(1)]);
-      else if (head.kind === "ctor" && this.covers(head.ctor, c)) out.push([...head.fields, ...row.slice(1)]);
+      else if (head.kind === "ctor" && this.covers(head.ctor, c)) {
+        let fields = head.fields;
+        if (head.ctor.kind === "slice" && head.ctor.varlen) {
+          // Line a `[a, .., z]` row up with this length: wildcards fill the middle.
+          const { prefix, suffix } = head.ctor;
+          const middle = fieldTys.slice(prefix, arity - suffix).map((t): DPat => ({ kind: "wild", ty: t }));
+          fields = [...fields.slice(0, prefix), ...middle, ...fields.slice(prefix)];
+        }
+        out.push([...fields, ...row.slice(1)]);
+      }
     }
     return out;
   }
@@ -271,18 +371,20 @@ export class ExhaustivenessChecker {
         return [head, ...v.slice(1)];
       }
       const ftys = this.fieldTys(ty, undefined, head.ctor);
-      const w = this.useful(this.specialize(rows, head.ctor, head.fields.length, ftys), [...head.fields, ...v.slice(1)]);
+      const subs = head.behindRef || ty.k === "ref" ? head.fields.map((f) => this.behind(f)) : head.fields;
+      const w = this.useful(this.specialize(rows, head.ctor, head.fields.length, ftys), [...subs, ...v.slice(1)]);
       if (!w) return undefined;
       return [{ kind: "ctor", ctor: head.ctor, fields: w.slice(0, head.fields.length), ty }, ...w.slice(head.fields.length)];
     }
     // Wildcard: is every constructor of the type present in the first column?
-    const all = this.allCtors(ty);
     const present = rows.flatMap((r) => (r[0].kind === "ctor" ? [r[0].ctor] : []));
+    const all = ty.k === "slice" ? this.sliceCtors(present) : this.allCtors(ty, head.behindRef);
+    const behindRef = head.behindRef || ty.k === "ref";
     const complete = all !== undefined && all.every((c) => present.some((p) => this.covers(p, c)));
     if (all !== undefined && complete) {
       for (const c of all) {
         const ftys = this.fieldTys(ty, undefined, c);
-        const w = this.useful(this.specialize(rows, c, ftys.length, ftys), [...ftys.map((t): DPat => ({ kind: "wild", ty: t })), ...v.slice(1)]);
+        const w = this.useful(this.specialize(rows, c, ftys.length, ftys), [...ftys.map((t): DPat => ({ kind: "wild", ty: t, behindRef })), ...v.slice(1)]);
         if (w) return [{ kind: "ctor", ctor: c, fields: w.slice(0, ftys.length), ty }, ...w.slice(ftys.length)];
       }
       return undefined;
@@ -315,6 +417,11 @@ export class ExhaustivenessChecker {
       case "range": return p.ctor.lo === p.ctor.hi ? String(p.ctor.lo) : `${p.ctor.lo}..=${p.ctor.hi}`;
       case "str": return JSON.stringify(p.ctor.value);
       case "opaque": return "_";
+      case "slice": {
+        const shown = p.fields.map((f) => this.show(f));
+        if (p.ctor.varlen) shown.splice(p.ctor.prefix, 0, "..");
+        return `[${shown.join(", ")}]`;
+      }
       case "single":
         if (ty.k === "tuple") return `(${p.fields.map((f) => this.show(f)).join(", ")})`;
         if (ty.k === "ref") return `&${this.show(p.fields[0])}`;

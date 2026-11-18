@@ -91,6 +91,151 @@ impl<T> Option<T> {
     pub fn iter(&self) -> crate::option::Iter<T> {
         crate::option::Iter { inner: self.as_ref() }
     }
+
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Option<U> {
+        match self {
+            Some(value) => Some(f(value)),
+            None => None,
+        }
+    }
+
+    pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Option<T> {
+        if let Some(value) = &self {
+            f(value);
+        }
+        self
+    }
+
+    pub fn map_or<U, F: FnOnce(T) -> U>(self, default: U, f: F) -> U {
+        match self {
+            Some(value) => f(value),
+            None => default,
+        }
+    }
+
+    pub fn map_or_else<U, D: FnOnce() -> U, F: FnOnce(T) -> U>(self, default: D, f: F) -> U {
+        match self {
+            Some(value) => f(value),
+            None => default(),
+        }
+    }
+
+    pub fn and_then<U, F: FnOnce(T) -> Option<U>>(self, f: F) -> Option<U> {
+        match self {
+            Some(value) => f(value),
+            None => None,
+        }
+    }
+
+    pub fn or_else<F: FnOnce() -> Option<T>>(self, f: F) -> Option<T> {
+        match self {
+            Some(value) => Some(value),
+            None => f(),
+        }
+    }
+
+    pub fn filter<P: FnOnce(&T) -> bool>(self, predicate: P) -> Option<T> {
+        if let Some(value) = self {
+            if predicate(&value) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    pub fn unwrap_or_else<F: FnOnce() -> T>(self, f: F) -> T {
+        match self {
+            Some(value) => value,
+            None => f(),
+        }
+    }
+
+    pub fn ok_or_else<E, F: FnOnce() -> E>(self, err: F) -> Result<T, E> {
+        match self {
+            Some(value) => Ok(value),
+            None => Err(err()),
+        }
+    }
+
+    pub fn is_some_and<F: FnOnce(T) -> bool>(self, f: F) -> bool {
+        match self {
+            Some(value) => f(value),
+            None => false,
+        }
+    }
+
+    pub fn is_none_or<F: FnOnce(T) -> bool>(self, f: F) -> bool {
+        match self {
+            Some(value) => f(value),
+            None => true,
+        }
+    }
+
+    pub fn get_or_insert_with<F: FnOnce() -> T>(&mut self, f: F) -> &mut T {
+        if self.is_none() {
+            *self = Some(f());
+        }
+        match self {
+            Some(value) => value,
+            None => unreachable!(),
+        }
+    }
+
+    pub fn zip<U>(self, other: Option<U>) -> Option<(T, U)> {
+        match (self, other) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }
+    }
+}
+
+/// Collecting `Option`s stops at the first `None`.
+struct UntilNone<'a, I> {
+    iter: I,
+    failed: &'a mut bool,
+}
+
+impl<'a, T, I: Iterator<Item = Option<T>>> Iterator for UntilNone<'a, I> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        match self.iter.next() {
+            Some(Some(value)) => Some(value),
+            Some(None) => {
+                *self.failed = true;
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+impl<A, V: crate::iter::FromIterator<A>> crate::iter::FromIterator<Option<A>> for Option<V> {
+    fn from_iter<I: Iterator<Item = Option<A>>>(iter: I) -> Option<V> {
+        let mut failed = false;
+        let collected = V::from_iter(UntilNone { iter: iter, failed: &mut failed });
+        if failed { None } else { Some(collected) }
+    }
+}
+
+/// Owning iterator over the zero or one values of an `Option`.
+#[derive(Clone)]
+pub struct IntoIter<T> {
+    inner: Option<T>,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        self.inner.take()
+    }
+}
+
+impl<T> IntoIterator for Option<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+    fn into_iter(self) -> IntoIter<T> {
+        IntoIter { inner: self }
+    }
 }
 
 impl<T: Default> Option<T> {

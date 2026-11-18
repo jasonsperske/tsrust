@@ -30,7 +30,7 @@
 import type { Program } from "./program.ts";
 
 const MAGIC = [0x54, 0x53, 0x52, 0x42]; // "TSRB"
-export const FORMAT_VERSION = 2;
+export const FORMAT_VERSION = 3;
 
 class ByteWriter {
   private buf = new Uint8Array(1024);

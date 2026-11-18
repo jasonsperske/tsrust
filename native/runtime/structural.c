@@ -7,7 +7,7 @@
  */
 #include "runtime.h"
 
-static int ref_is_value(V td) { return rt_type(td)[0] == T_STR; }
+static int ref_is_value(V td) { u32 k = rt_type(td)[0]; return k == T_STR || k == T_SLICE; }
 
 /* For an enum descriptor, find variant `tag`: returns a pointer to (name, kind, n, fields...). */
 static const u32 *enum_variant(const u32 *t, u32 tag) {
@@ -41,7 +41,7 @@ int deep_eq(V a, V b, V td) {
       for (u32 i = 0; i < v[2]; i++) if (!deep_eq(x->f[i], y->f[i], v[4 + 2 * i])) return 0;
       return 1;
     }
-    case T_VEC: {
+    case T_VEC: case T_SLICE: {
       const Vec *x = (const Vec *)a, *y = (const Vec *)b;
       if (x->len != y->len) return 0;
       for (u64 i = 0; i < x->len; i++) if (!deep_eq(x->data[i], y->data[i], t[1])) return 0;
@@ -85,7 +85,7 @@ i64 deep_cmp(V a, V b, V td) {
       for (u32 i = 0; i < v[2]; i++) if ((c = deep_cmp(x->f[i], y->f[i], v[4 + 2 * i]))) return c;
       return 0;
     }
-    case T_VEC: {
+    case T_VEC: case T_SLICE: {
       const Vec *x = (const Vec *)a, *y = (const Vec *)b;
       u64 n = x->len < y->len ? x->len : y->len;
       for (u64 i = 0; i < n; i++) if ((c = deep_cmp(x->data[i], y->data[i], t[1]))) return c;
@@ -135,7 +135,7 @@ V deep_clone(V v, V td) {
 /* COPY: duplicate a Copy aggregate so the copy can't alias the original. */
 V copy_value(V v, V td) {
   const u32 *t = rt_type(td);
-  if (t[0] == T_TUPLE || t[0] == T_STRUCT || t[0] == T_ENUM) return deep_clone(v, td);
+  if (t[0] == T_TUPLE || t[0] == T_STRUCT || t[0] == T_ENUM || t[0] == T_VEC) return deep_clone(v, td);
   return v;
 }
 
@@ -155,6 +155,12 @@ u64 hash_value(V v, V td) {
     }
     case T_REF: return ref_is_value(t[1]) ? hash_value(v, t[1]) : hash_value(*(V *)v, t[1]);
     case T_BOX: return hash_value(*(V *)v, t[1]);
+    case T_VEC: case T_SLICE: {
+      const Vec *x = (const Vec *)v;
+      u64 h = 17 + x->len;
+      for (u64 i = 0; i < x->len; i++) h = mix(h, hash_value(x->data[i], t[1]));
+      return h;
+    }
     case T_TUPLE: {
       u64 h = 7;
       for (u32 i = 0; i < t[1]; i++) h = mix(h, hash_value(((Agg *)v)->f[i], t[2 + i]));

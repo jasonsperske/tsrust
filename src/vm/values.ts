@@ -12,17 +12,20 @@
  * | `()`                         | `undefined`                               |
  * | struct, tuple, enum variant  | {@link Agg}: a tag plus an array of fields |
  * | `String`                     | {@link RString}: a mutable box around a JS string |
- * | `Vec<T>`                     | {@link RVec}                              |
+ * | `Vec<T>`, `[T; N]`           | {@link RVec}                              |
+ * | `&[T]`, `&mut [T]`           | {@link RSlice}: a window onto an array    |
+ * | closure                      | {@link Agg} of its captured values        |
+ * | `fn` pointer                 | the function's index                      |
  * | `Box<T>`                     | a one-element JS array `[value]`          |
  * | `HashMap<K, V>`              | {@link RMap}                              |
- * | `&T`, `&mut T`               | {@link Ref}: an array plus an index       |
+ * | `&T`, `&mut T`, `*const T`   | {@link Ref}: an array plus an index       |
  *
  * A `Ref` names a *slot*: a local variable's slot in its frame, a struct
  * field, a vector element, or a box's contents. Every one of those lives in a
  * JS array, so `Ref { base, i }` can read and write any of them uniformly.
  */
 
-export type Value = number | boolean | string | undefined | Agg | RString | RVec | RMap | Ref | Value[];
+export type Value = number | boolean | string | undefined | Agg | RString | RVec | RSlice | RMap | Ref | Value[];
 
 /** A struct, tuple or enum variant. For enums, `tag` is the variant index. */
 export class Agg {
@@ -46,6 +49,26 @@ export class RVec {
   constructor(items: Value[]) {
     this.items = items;
   }
+}
+
+/** A slice: `len` elements of `items` starting at `start`. */
+export class RSlice {
+  items: Value[];
+  start: number;
+  len: number;
+  constructor(items: Value[], start: number, len: number) {
+    this.items = items;
+    this.start = start;
+    this.len = len;
+  }
+  toArray(): Value[] {
+    return this.items.slice(this.start, this.start + this.len);
+  }
+}
+
+/** The elements of a `Vec`, array or slice. */
+export function seqItems(v: Value): Value[] {
+  return v instanceof RSlice ? v.toArray() : (v as RVec).items;
 }
 
 /** Insertion-ordered hash map. Removed entries leave a tombstone so iteration indices stay stable. */
@@ -104,7 +127,7 @@ export function keyOf(v: Value): string {
   if (v === undefined) return "u";
   if (v instanceof RString) return `s${v.s}`;
   if (v instanceof Agg) return `a${v.tag}(${v.f.map(keyOf).join(",")})`;
-  if (v instanceof RVec) return `v[${v.items.map(keyOf).join(",")}]`;
+  if (v instanceof RVec || v instanceof RSlice) return `v[${seqItems(v).map(keyOf).join(",")}]`;
   if (Array.isArray(v)) return keyOf(v[0]);
   return "?";
 }

@@ -11,7 +11,9 @@
 //! Every crate gets `std::prelude::*` imported automatically, which is why
 //! user code can say `Some(5)` and `Vec::new()` without any `use`.
 
+pub mod array;
 pub mod boxed;
+pub mod cell;
 pub mod clone;
 pub mod cmp;
 pub mod collections;
@@ -26,7 +28,9 @@ pub mod ops;
 pub mod option;
 pub mod prelude;
 pub mod process;
+pub mod ptr;
 pub mod result;
+pub mod slice;
 pub mod str;
 pub mod string;
 pub mod vec;

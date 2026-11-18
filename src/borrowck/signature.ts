@@ -133,6 +133,14 @@ export class SignatureChecker {
           break;
         case "tuple": t.elems.forEach(go); break;
         case "qpath": go(t.self); break;
+        case "ptr": go(t.inner); break;
+        case "slice": case "array": go(t.elem); break;
+        case "implTrait":
+          t.lifetimes.forEach((l) => useLt(l, t.span));
+          // A returned `impl Trait` may hold values of every type parameter in scope.
+          for (const b of t.bounds) for (const seg of b.segments) { seg.generics?.forEach(go); seg.bindings?.forEach((x) => go(x.ty)); }
+          out.params.add("*");
+          break;
         case "path": {
           const pr = this.tcx.res.paths.get(t.path.id);
           const last = t.path.segments[t.path.segments.length - 1];
@@ -147,7 +155,7 @@ export class SignatureChecker {
               for (let i = written.length; i < declaredLts; i++) fresh();
             }
           }
-          for (const seg of t.path.segments) seg.generics?.forEach(go);
+          for (const seg of t.path.segments) { seg.generics?.forEach(go); seg.bindings?.forEach((x) => go(x.ty)); }
           break;
         }
       }
@@ -224,7 +232,7 @@ export class SignatureChecker {
     const retNames = new Set([...ret.lifetimes, ...ret.params]);
     const flows: ArgFlow[] = inputs.map((inp) => {
       if (inp.isRef && inp.outer && retNames.has(inp.outer)) return "full";
-      const innerHit = [...inp.inner.lifetimes, ...inp.inner.params].some((n) => retNames.has(n));
+      const innerHit = [...inp.inner.lifetimes, ...inp.inner.params].some((n) => retNames.has(n)) || (retNames.has("*") && inp.inner.params.size > 0);
       if (!innerHit) return "none";
       return inp.isRef ? "inner" : "full";
     });

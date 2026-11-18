@@ -532,23 +532,17 @@ error: expected pattern, found `{`
 3 | fn broken( {
   |            ^
 
-error: closures are not supported by TSRust yet
- --> errs.rs:9:26
+error: `dyn` types are not supported by TSRust yet
+ --> errs.rs:9:17
   |
-9 |     let n = v.iter().map(|x| x * 2).count();
-  |                          ^
+9 |     let n: Vec<&dyn Clone> = Vec::new();
+  |                 ^^^
 
-error: expected expression, found `)`
- --> errs.rs:9:35
-  |
-9 |     let n = v.iter().map(|x| x * 2).count();
-  |                                   ^
-
-error: arrays and slices are not supported by TSRust yet; use `Vec<T>`
-  --> errs.rs:10:12
+error: `let ... else` is not supported by TSRust yet
+  --> errs.rs:10:29
    |
-10 |     let a: [i32; 3] = [1, 2, 3];
-   |            ^
+10 |     let Some(a) = v.first() else { return };
+   |                             ^^^^
 
 error: comparison operators cannot be chained
   --> errs.rs:11:14
@@ -557,9 +551,9 @@ error: comparison operators cannot be chained
    |              ^
 ```
 
-Recovery is never perfect. The third error above is a **cascade**: after the closure error, `recoverInBlock` stops at the `)` that closes `map(` (it treats any unmatched closer as the end of the block) without consuming it, and the next statement then starts at `)`. The same happens after any error inside macro parentheses. Making recovery smarter about which bracket it is inside is one of the exercises.
+Recovery is never perfect. An error inside parentheses often causes a **cascade**: `recoverInBlock` stops at the `)` that closes the call (it treats any unmatched closer as the end of the block) without consuming it, and the next statement then starts at `)`. Making recovery smarter about which bracket it is inside is one of the exercises.
 
-The same machinery gives clear messages for unsupported features, because the parser checks for them at the point where they would start: `|` or `move` in expression position is a closure, `[` in a type is an array or slice, and `dyn`, `impl` or `fn` in a type are rejected by `parseType`.
+The same machinery gives clear messages for unsupported features, because the parser checks for them at the point where they would start: `dyn` in a type is rejected by `parseType`, and `else` after a `let` initializer by `parseStmt`.
 
 ## Walking the tree
 
@@ -570,7 +564,7 @@ Each later stage has its own detailed traversal, but some jobs just need "every 
 - **No token trees or `macro_rules!`.** Macros are a fixed list parsed as expressions. `stringify!`, `matches!`, `include_str!` and user macros are rejected with "cannot find macro".
 - **Format specs are a subset.** Width, alignment, fill, sign, hex (`{:x}`) and named arguments (`{x}` with `x = 5` after the string) are rejected; only inline captures of local variables are supported. `{:>8}` gives "unsupported format spec".
 - **Desugaring happens in the parser.** rustc keeps `if let` in its AST and lowers it to HIR later; TSRust rewrites it immediately. `let ... else` is not supported.
-- **Unsupported syntax:** closures, arrays/slices, `dyn`/`impl`/`fn` types, `static`, `unsafe`, `async`, attributes other than `#[derive]` (others are skipped silently), `pub(crate)` (treated as `pub`).
+- **Unsupported syntax:** `dyn` types, `async`, unions, `<T>::item` paths in expressions, attributes other than `#[derive]` (others are skipped silently), `pub(crate)` (treated as `pub`).
 - **Error messages are simpler.** rustc has dozens of targeted suggestions (missing turbofish, parenthesize struct literal, missing comma). TSRust reports the raw expectation.
 - **Recovery cascades.** After an error inside parentheses, a spurious `expected expression, found ')'` often follows. Similarly, after an unsupported `impl` type in a parameter list, `recoverToItem` stops right at the `impl` keyword (it looks like the start of an item) and reports a second error.
 

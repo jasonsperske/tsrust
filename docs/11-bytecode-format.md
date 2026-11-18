@@ -88,7 +88,7 @@ Each section in more detail:
 | Section | Encoding | Notes |
 |---|---|---|
 | magic | bytes `54 53 52 42` | ASCII `TSRB`. The reader rejects other files with "not a TSRust bytecode file (bad magic number)". |
-| version | 1 byte | `FORMAT_VERSION = 2`. A mismatch produces "unsupported .tsrb version 1 (expected 2)". |
+| version | 1 byte | `FORMAT_VERSION = 3`. A mismatch produces "unsupported .tsrb version 2 (expected 3)". |
 | constants | uvar count, then a tag byte per constant | Tag `0`: an IEEE-754 `f64`, 8 bytes, little-endian. Tag `1`: a string. Every number is stored as an `f64`, integers included ([12-the-vm.md](12-the-vm.md) explains why). `char` constants are one-character strings. The instruction that uses a constant (`CONST`, `CONST_F` or `CONST_CHAR`) says which kind of value it is. |
 | types | one string | The runtime type descriptors, as JSON. |
 | intrinsics | uvar count, then strings | Names such as `Vec::push`. `INTRINSIC` operands index this list, and the VM looks each name up in its native table. |
@@ -266,7 +266,7 @@ $ xxd main.tsrb
 | Offset | Bytes | Meaning |
 |---|---|---|
 | `00` | `54 53 52 42` | magic `TSRB` |
-| `04` | `02` | format version 2 |
+| `04` | `03` | format version 3 |
 | `05` | `02` | 2 constants |
 | `06` | `00` + `00 00 00 00 00 00 44 40` | tag 0 (number): `40.0` as a little-endian f64 (`0x4044000000000000`) |
 | `0f` | `00` + `00 00 00 00 00 00 00 40` | tag 0 (number): `2.0` |

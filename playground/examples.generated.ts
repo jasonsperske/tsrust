@@ -167,6 +167,50 @@ export const EXAMPLES: Example[] = [
   "name": "15_game_of_life"
  },
  {
+  "id": "16_never_type",
+  "title": "16 · Never type",
+  "group": "A tour of Rust",
+  "files": {
+   "/main.rs": "// The never type `!`, stabilized in Rust 1.100, plus some small library\n// additions from the same release.\nuse std::convert::Infallible;\nuse std::str::FromStr;\n\n// An error type of `!` means this conversion cannot fail...\nstruct Name(String);\n\nimpl FromStr for Name {\n    type Err = !;\n    fn from_str(s: &str) -> Result<Name, !> {\n        Ok(Name(String::from(s.trim_prefix(\"name:\"))))\n    }\n}\n\n// ...so `Ok(v)` is the only pattern needed, and `let` accepts it.\nfn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {\n    let Ok(value) = result;\n    value\n}\n\n// A variant holding `!` can never be built, so `match` may skip it.\nenum Step {\n    Next(u32),\n    #[allow(dead_code)]\n    Impossible(!),\n}\n\nfn advance(step: Step) -> u32 {\n    match step {\n        Step::Next(n) => n + 1,\n    }\n}\n\n// `!` coerces to any type, which is why `return` works as a match arm.\nfn parse_or_zero(text: &str) -> i32 {\n    let value = match text.parse::<i32>() {\n        Ok(n) => n,\n        Err(_) => return 0,\n    };\n    value * 2\n}\n\nfn fail(message: &str) -> ! {\n    panic!(\"{}\", message)\n}\n\nfn checked(n: i32) -> i32 {\n    if n >= 0 { n } else { fail(\"negative\") }\n}\n\nfn main() {\n    let Ok(name) = \"name:Ferris\".parse::<Name>();\n    println!(\"{}\", name.0);\n\n    println!(\"{}\", unwrap_infallible(Ok::<i32, !>(42)));\n    println!(\"{}\", advance(Step::Next(1)));\n    println!(\"{} {}\", parse_or_zero(\"21\"), parse_or_zero(\"x\"));\n    println!(\"{}\", checked(5));\n\n    let nothing: Option<!> = None;\n    let values: Vec<!> = Vec::new();\n    println!(\"{:?} {:?}\", nothing, values);\n\n    let mut on = false;\n    on.toggle();\n    println!(\"{}\", on);\n\n    let file = \"report.txt\";\n    println!(\"{} {}\", file.trim_suffix(\".txt\"), file.trim_suffix(\".md\"));\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "16_never_type"
+ },
+ {
+  "id": "17_closures",
+  "title": "17 · Closures",
+  "group": "A tour of Rust",
+  "files": {
+   "/main.rs": "// Closures capture what they use: by reference, by mutable reference, or by\n// value. The compiler works out which from the closure's body.\n\nfn apply_twice<F: Fn(i32) -> i32>(f: F, x: i32) -> i32 {\n    f(f(x))\n}\n\nfn call_n(n: u32, mut f: impl FnMut()) {\n    for _ in 0..n {\n        f();\n    }\n}\n\nfn consume<F: FnOnce() -> String>(f: F) -> String {\n    f()\n}\n\n// Returning a closure: `move` makes it own `n`.\nfn adder(n: i32) -> impl Fn(i32) -> i32 {\n    move |x| x + n\n}\n\nfn counter() -> impl FnMut() -> u32 {\n    let mut count = 0;\n    move || {\n        count += 1;\n        count\n    }\n}\n\nfn compose<A, B, C>(f: impl Fn(A) -> B, g: impl Fn(B) -> C) -> impl Fn(A) -> C {\n    move |x| g(f(x))\n}\n\nfn double(x: i32) -> i32 {\n    x * 2\n}\n\nstruct Button<F> {\n    label: String,\n    on_click: F,\n}\n\nimpl<F: FnMut(&str)> Button<F> {\n    fn click(&mut self) {\n        (self.on_click)(&self.label);\n    }\n}\n\n#[derive(Debug)]\nstruct Item {\n    name: String,\n    price: u32,\n}\n\nfn main() {\n    let offset = 10;\n    println!(\"{}\", apply_twice(|x| x + offset, 1));\n\n    let mut total = 0;\n    call_n(3, || total += 2);\n    println!(\"{}\", total);\n\n    let name = String::from(\"Ferris\");\n    println!(\"{}\", consume(move || name + \"!\"));\n\n    println!(\"{}\", adder(5)(1));\n    let mut next = counter();\n    next();\n    println!(\"{}\", next());\n    println!(\"{}\", compose(double, |n: i32| format!(\"<{}>\", n))(4));\n\n    // Functions and constructors can be used wherever a closure can.\n    let table: [fn(i32) -> i32; 2] = [double, |x| x - 1];\n    println!(\"{:?}\", table.iter().map(|f| f(10)).collect::<Vec<_>>());\n    println!(\"{:?}\", vec![1, 2].into_iter().map(Some).collect::<Vec<_>>());\n\n    let mut log = Vec::new();\n    let mut button = Button { label: String::from(\"OK\"), on_click: |s: &str| log.push(s.len()) };\n    button.click();\n    button.click();\n    println!(\"{:?}\", log);\n\n    let mut items = vec![\n        Item { name: String::from(\"pear\"), price: 3 },\n        Item { name: String::from(\"fig\"), price: 9 },\n        Item { name: String::from(\"kiwi\"), price: 5 },\n    ];\n    items.sort_by_key(|i| i.price);\n    let limit = 4;\n    let names: Vec<&str> = items.iter().filter(|i| i.price > limit).map(|i| i.name.as_str()).collect();\n    println!(\"{}\", names.join(\", \"));\n    println!(\"{}\", items.iter().fold(0, |sum, i| sum + i.price));\n    println!(\"{:?}\", items.iter().find(|i| i.name.starts_with(\"k\")));\n    println!(\"{:?}\", Some(3).map(|x| x * x).filter(|x| *x > 5).unwrap_or_else(|| 0));\n    println!(\"{:?}\", Vec::from_fn(4, |i| i * i));\n    println!(\"{}\", Box::map(Box::new(20), |x| x + 1));\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "17_closures"
+ },
+ {
+  "id": "18_slices",
+  "title": "18 · Slices",
+  "group": "A tour of Rust",
+  "files": {
+   "/main.rs": "// Arrays hold a fixed number of elements. Slices are borrowed views of\n// consecutive elements, and can point into arrays, vectors or other slices.\n\nconst SIZE: usize = 3;\n\nfn sum(values: &[i32]) -> i32 {\n    let mut total = 0;\n    for v in values {\n        total += v;\n    }\n    total\n}\n\nfn zero_first(values: &mut [i32]) {\n    if let Some(first) = values.first_mut() {\n        *first = 0;\n    }\n}\n\nfn describe(values: &[i32]) -> String {\n    match values {\n        [] => String::from(\"empty\"),\n        [one] => format!(\"just {}\", one),\n        [first, .., last] if first == last => format!(\"bookends {}\", first),\n        [first, rest @ ..] => format!(\"{} then {} more\", first, rest.len()),\n    }\n}\n\nfn quicksort(a: &mut [i32]) {\n    if a.len() < 2 {\n        return;\n    }\n    let last = a.len() - 1;\n    let pivot = a[last];\n    let mut store = 0;\n    for i in 0..last {\n        if a[i] < pivot {\n            a.swap(store, i);\n            store += 1;\n        }\n    }\n    a.swap(store, last);\n    let (left, right) = a.split_at_mut(store);\n    quicksort(left);\n    quicksort(&mut right[1..]);\n}\n\n// A const generic: this works for arrays of any length.\nfn length<T, const N: usize>(_array: &[T; N]) -> usize {\n    N\n}\n\nfn main() {\n    let mut numbers = [4, 8, 15, 16, 23, 42];\n    println!(\"{:?} {}\", numbers, numbers.len());\n    println!(\"{} {}\", sum(&numbers), sum(&numbers[1..3]));\n\n    // Arrays of `Copy` values are copied, not aliased.\n    let copy = numbers;\n    zero_first(&mut numbers[2..]);\n    println!(\"{:?}\\n{:?}\", numbers, copy);\n\n    let vector = vec![1, 2, 3];\n    println!(\"{} {}\", sum(&vector), vector == [1, 2, 3]);\n\n    println!(\"{}\", describe(&[]));\n    println!(\"{}\", describe(&[7]));\n    println!(\"{}\", describe(&[7, 1, 7]));\n    println!(\"{}\", describe(&[1, 2, 3]));\n\n    let mut grid = [[0; SIZE]; SIZE];\n    for (i, row) in grid.iter_mut().enumerate() {\n        row[i] = 1;\n    }\n    println!(\"{:?}\", grid);\n\n    let mut data = [9, 3, 7, 1, 8];\n    quicksort(&mut data);\n    println!(\"{:?} {:?}\", data, data.binary_search(&7));\n\n    println!(\"{:?}\", data.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>());\n    println!(\"{:?}\", data.chunks(2).collect::<Vec<_>>());\n    println!(\"{:?}\", data.iter().rev().take(2).collect::<Vec<_>>());\n    println!(\"{:?} {:?}\", data.trim_prefix(&[1, 3]), data.trim_suffix(&[100]));\n    println!(\"{:?}\", [1, 2, 3].map(|x| x * 10));\n    println!(\"{}\", length(&[\"a\", \"b\"]));\n    println!(\"{}\", [\"x\", \"y\", \"z\"].join(\"-\"));\n\n    let [a, b, ..] = data;\n    println!(\"{}\", a + b);\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "18_slices"
+ },
+ {
+  "id": "19_unsafe",
+  "title": "19 · Unsafe",
+  "group": "A tour of Rust",
+  "files": {
+   "/main.rs": "// `unsafe` unlocks a few extra powers. The compiler stops checking those\n// operations, so keeping them valid becomes your responsibility.\n\nuse std::cell::UnsafeCell;\nuse std::mem;\nuse std::ptr;\nuse std::slice;\n\nstatic GREETING: &str = \"hello\";\nstatic mut COUNTER: u32 = 0;\n\nfn next_id() -> u32 {\n    unsafe {\n        COUNTER += 1;\n        COUNTER\n    }\n}\n\nunsafe fn write_twice(p: *mut i32, value: i32) {\n    *p = value;\n    *p += value;\n}\n\nunsafe trait Zeroed {\n    fn zeroed() -> Self;\n}\n\nunsafe impl Zeroed for u8 {\n    fn zeroed() -> u8 {\n        0\n    }\n}\n\n// A safe function built on unsafe code, like the real `split_at_mut`.\nfn split_pair(s: &mut [i32], mid: usize) -> (&mut [i32], &mut [i32]) {\n    assert!(mid <= s.len());\n    let len = s.len();\n    let p = s.as_mut_ptr();\n    unsafe { (slice::from_raw_parts_mut(p, mid), slice::from_raw_parts_mut(p.add(mid), len - mid)) }\n}\n\nstruct Node {\n    value: i32,\n    next: *mut Node,\n}\n\nstruct Stack {\n    head: *mut Node,\n}\n\nimpl Stack {\n    fn push(&mut self, value: i32) {\n        self.head = Box::into_raw(Box::new(Node { value, next: self.head }));\n    }\n\n    fn pop(&mut self) -> Option<i32> {\n        if self.head.is_null() {\n            return None;\n        }\n        let node = unsafe { Box::from_raw(self.head) };\n        self.head = node.next;\n        Some(node.value)\n    }\n}\n\n#[derive(Debug)]\nstruct Marker;\n\nfn main() {\n    let mut x = 1;\n    let p = &mut x as *mut i32;\n    unsafe {\n        write_twice(p, 21);\n        println!(\"{}\", *p);\n    }\n    println!(\"{}\", x);\n\n    let field = (1, 2);\n    let second = &raw const field.1;\n    println!(\"{}\", unsafe { *second });\n\n    next_id();\n    println!(\"{} {}\", GREETING, next_id());\n    println!(\"{}\", u8::zeroed());\n\n    let mut numbers = [1, 2, 3, 4];\n    let (left, right) = split_pair(&mut numbers, 1);\n    left[0] = 10;\n    right[0] = 20;\n    println!(\"{:?}\", numbers);\n\n    let mut stack = Stack { head: ptr::null_mut() };\n    stack.push(1);\n    stack.push(2);\n    println!(\"{:?} {:?} {:?}\", stack.pop(), stack.pop(), stack.pop());\n\n    let cell = UnsafeCell::new(5);\n    unsafe {\n        *cell.get() += 1;\n        println!(\"{} {}\", cell.replace(9), cell.as_ref_unchecked());\n    }\n\n    let marker: Marker = unsafe { mem::conjure_zst() };\n    println!(\"{:?}\", marker);\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "19_unsafe"
+ },
+ {
   "id": "packages",
   "title": "Three crates: app → geometry → util",
   "group": "Packages and modules",
@@ -219,6 +263,17 @@ export const EXAMPLES: Example[] = [
   "name": "E0106_missing_lifetime"
  },
  {
+  "id": "E0133_unsafe_call",
+  "title": "E0133 · unsafe call",
+  "group": "Compile errors (on purpose)",
+  "files": {
+   "/main.rs": "unsafe fn dangerous() {}\n\nfn main() {\n    dangerous();\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "E0133_unsafe_call"
+ },
+ {
   "id": "E0277_trait_not_implemented",
   "title": "E0277 · trait not implemented",
   "group": "Compile errors (on purpose)",
@@ -239,6 +294,17 @@ export const EXAMPLES: Example[] = [
   "entry": "/main.rs",
   "open": "/main.rs",
   "name": "E0308_mismatched_types"
+ },
+ {
+  "id": "E0373_closure_may_outlive",
+  "title": "E0373 · closure may outlive",
+  "group": "Compile errors (on purpose)",
+  "files": {
+   "/main.rs": "fn make() -> impl Fn() -> i32 {\n    let x = 1;\n    || x\n}\n\nfn main() {\n    println!(\"{}\", make()());\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "E0373_closure_may_outlive"
  },
  {
   "id": "E0382_use_after_move",
@@ -307,6 +373,17 @@ export const EXAMPLES: Example[] = [
   "name": "E0507_move_out_of_borrow"
  },
  {
+  "id": "E0508_move_out_of_array",
+  "title": "E0508 · move out of array",
+  "group": "Compile errors (on purpose)",
+  "files": {
+   "/main.rs": "fn main() {\n    let names = [String::from(\"a\")];\n    let first = names[0];\n    println!(\"{}\", first);\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "E0508_move_out_of_array"
+ },
+ {
   "id": "E0515_return_local_reference",
   "title": "E0515 · return local reference",
   "group": "Compile errors (on purpose)",
@@ -316,6 +393,17 @@ export const EXAMPLES: Example[] = [
   "entry": "/main.rs",
   "open": "/main.rs",
   "name": "E0515_return_local_reference"
+ },
+ {
+  "id": "E0525_closure_kind",
+  "title": "E0525 · closure kind",
+  "group": "Compile errors (on purpose)",
+  "files": {
+   "/main.rs": "fn call_twice<F: Fn()>(f: F) {\n    f();\n    f();\n}\n\nfn main() {\n    let name = String::from(\"once\");\n    let consume = || drop(name);\n    call_twice(consume);\n}\n"
+  },
+  "entry": "/main.rs",
+  "open": "/main.rs",
+  "name": "E0525_closure_kind"
  },
  {
   "id": "E0596_not_mutable",

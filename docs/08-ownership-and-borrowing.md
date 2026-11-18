@@ -676,7 +676,7 @@ TSRust's checker is deliberately small, and it's honest to list where it is weak
 - **Temporaries never "die".** Temporaries have no `dead` statement, and E0597 only considers user variables. So `let r: &String; { r = &String::from("t"); } println!("{}", r);` is accepted. rustc reports E0716 (temporary value dropped while borrowed).
 - **Index projections are opaque.** `v[_]` has no idea which element is meant, so two `&mut v[i]` always conflict. rustc behaves the same here, which is why `split_at_mut` exists.
 - **Overlap is conservative.** If two projections at the same position have different kinds, they are assumed to overlap.
-- **No drop elaboration, no closures, no `unsafe`.** There are no `Drop`-aware checks such as borrows that conflict with a destructor running at scope end. rustc's MIR has explicit `drop` terminators. TSRust has only `StorageDead`.
+- **No drop elaboration.** There are no `Drop`-aware checks such as borrows that conflict with a destructor running at scope end. rustc's MIR has explicit `drop` terminators. TSRust has only `StorageDead`.
 - **Diagnostics are reported once per (span, kind).** The `reported` set stops a loop's fixed-point re-runs from duplicating messages.
 
 The broader list is in [14-differences-from-rust.md](14-differences-from-rust.md).

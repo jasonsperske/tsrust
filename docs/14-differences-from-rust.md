@@ -6,7 +6,7 @@ The differences come from every stage of the pipeline:
 
 ```mermaid
 flowchart LR
-  P["parser<br/>closures, arrays, dyn,<br/>impl Trait, let-else,<br/>static, format specs"] --> R["resolve<br/>no trait-in-scope rule"]
+  P["parser<br/>dyn, let-else,<br/>format specs"] --> R["resolve<br/>no trait-in-scope rule"]
   R --> T["typeck<br/>no From in ?,<br/>no derive(Default),<br/>no Borrow, no assoc consts"]
   T --> B["borrowck<br/>flow-based lifetimes,<br/>bodies not checked<br/>against signatures"]
   B --> C["codegen + VM<br/>structural derives,<br/>64-bit ints as doubles,<br/>no Drop, insertion-ordered maps"]
@@ -19,11 +19,8 @@ These give a clear compile error, usually pointing to a workaround.
 
 | Feature | What you get | Workaround |
 |---|---|---|
-| Closures `\|x\| x + 1` | "closures are not supported by TSRust yet" | write a named `fn` |
-| Arrays and slices `[T; N]`, `&[T]`, `[1, 2, 3]` | "arrays and slices are not supported by TSRust yet; use `Vec<T>`" | `Vec<T>`, `vec![...]` |
-| `dyn Trait`, `impl Trait`, `fn(...)` types | "\`dyn\` types are not supported by TSRust yet" | generics with trait bounds |
+| `dyn Trait` | "\`dyn\` types are not supported by TSRust yet" | generics with trait bounds |
 | `let ... else` | "\`let ... else\` is not supported by TSRust yet" | `match` or `if let` |
-| `static` items | parse error | `const` |
 | byte literals `b'a'`, `b"..."` | parse error | `'a' as u8` |
 | associated `const` in traits | "expected \`fn\`, found keyword \`const\`" | a method returning the value |
 | user macros | defining one: "expected item, found identifier \`macro_rules\`"; calling an unknown one: "cannot find macro" (lists the 15 built-ins) | functions |
@@ -50,15 +47,28 @@ The built-in macros are `println!`, `print!`, `eprintln!`, `eprint!`, `format!`,
 
 ## Type checking
 
-- **No closures or function values.** A function name used as a value is an error ("TSRust doesn't support function pointers or closures yet"), and so is a tuple-variant constructor used as a value (`let f = Some;`, E0533). As a result there is no `map`/`filter`/`fold`/`sort_by`/`unwrap_or_else` in the standard library ([13-standard-library.md](13-standard-library.md)).
 - **`?` does not call `From::from`.** The error type of the expression must equal the function's error type exactly. The diagnostic says so: "TSRust's \`?\` does not call \`From::from\` on errors". `Box<dyn Error>` is unavailable anyway.
 - **`#[derive(Default)]` is rejected** with a hint to write the impl by hand, even though `Default` is in the derivable list. The other derives (`Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash`) work.
 - **No `Borrow` trait.** `HashMap<&str, i32>::remove("apple")` fails with "expected `&&str`, found `&str`". Write `remove(&"apple")`.
 - **Operators on not-yet-known types** are assumed to be numeric. If inference later finds something else, you get E0369 with a note asking for a type annotation.
 - **Overloadable operators** are `+ - * / %`, unary `-`, and `+= -= *=`, through the lang items in `LANG_PATHS`. `Index`, `Not`, the bitwise traits, `DivAssign` and so on cannot be implemented for user types.
-- **Only bounded ranges** `a..b` and `a..=b` exist. `a..`, `..b` and `..` are rejected. `&v[1..3]` on a `Vec` is a type error, because there are no slices. Ranges of `char` aren't iterable (there is no `Step for char`).
+- **Ranges of `char` aren't iterable** (there is no `Step for char`). Slices are indexed only by range *syntax*: `&v[1..3]` works, but a `Range` stored in a variable doesn't.
 - **`i128`/`u128`** exist as types but have no methods.
 - **`?Sized`** is parsed and ignored.
+
+## Closures, slices and `unsafe`
+
+These work as [chapter 16](16-closures-slices-unsafe.md) describes, with these limits:
+
+- **Closure lifetimes aren't checked.** `let f = |x: &i32| x;` is accepted, where `rustc` reports "lifetime may not live long enough".
+- **`if` and `match` don't unify different closures or function items into a `fn` pointer.** Annotate the variable with the `fn(..)` type.
+- **Closure kinds are checked at the bound the closure is passed to.** A bound reached only through another impl's where-clause isn't checked for kind.
+- **Loans held by a closure are dropped from results that can't contain one.** This avoids false errors, but a generic function that returns a reference obtained from its closure argument isn't tracked.
+- **Only `Fn`-family traits and `Copy`/`Clone` are implemented for closures.** There is no `Box<dyn Fn>`, because there is no `dyn`.
+- **No `Box<[T]>` or `Rc<[T]>`.** Unsized coercion works only through references.
+- **Array lengths and const arguments** can use integer literals, constants, const parameters and arithmetic on them.
+- **No `transmute`, `size_of`, `MaybeUninit`, unions or `extern`.** Every value is one word, so pointer offsets count elements. `{:?}` of a raw pointer prints a fixed placeholder.
+- **Slice patterns** can't be used on `Vec` directly (the same as Rust), and an array bound by reference with `rest @ ..` refers to a copy of those elements.
 
 ## Borrow checking
 
@@ -123,7 +133,7 @@ The first four items are VM bugs. The native runtime formats floats with its own
 - **`{:?}` never uses exponent notation.** rustc prints `1e21`, `1e-7` and `1.5e300` for `Debug`. TSRust prints all the digits (`1000000000000000000000.0`, `0.0000001`, ...). `Display` matches, since rustc never uses exponents there either.
 - **`{:.N}` uses JavaScript's `toFixed`**, which rounds exact ties upward: `{:.0}` of `2.5` and `0.5` gives `3` and `1`, and `{:.1}` of `0.25` gives `0.3`. Recent rustc rounds ties to even (`2`, `0`, `0.2`).
 - **`char` and `&str` ordering** with `<`/`>` uses JavaScript string comparison (UTF-16 code units), not Unicode scalar values or bytes. It differs only above U+FFFF: `'\u{FFFD}' < '\u{1F600}'` is `false` in TSRust and `true` in Rust.
-- `Debug` of a `Range` prints `Range { start: 0, end: 5 }` instead of `0..5`. `ParseIntError` prints `ParseIntError { message: "invalid digit found in string" }` instead of `ParseIntError { kind: InvalidDigit }`, and an empty string gets the same message instead of "cannot parse integer from empty string".
+- `Debug` of a `Range` prints `0..5` directly, but inside a tuple or `Vec` it prints `Range { start: 0, end: 5 }`, because derived `Debug` is structural. `ParseIntError` prints `ParseIntError { message: "invalid digit found in string" }` instead of `ParseIntError { kind: InvalidDigit }`, and an empty string gets the same message instead of "cannot parse integer from empty string".
 - `Formatter::alternate()` is always `false`, and user `fmt` impls receive no width or precision.
 
 ### Memory, panics and the process
@@ -147,6 +157,19 @@ The native back end ([15-native-code.md](15-native-code.md)) compiles the same b
 - **No debug information**: no symbols, no section headers, no DWARF.
 - `HashMap` iterates in insertion order, as in the VM.
 
+## Rust 1.100 coverage
+
+TSRust follows the language and library changes of Rust 1.100 where its subset can express them.
+
+| Status | Items |
+|---|---|
+| Supported | the never type `!`, `!` fallback, `Infallible`, omitting patterns for empty types, `AsRef`/`AsMut` for `!`, `bool::toggle`, `str::trim_prefix`/`trim_suffix`, `[T]::trim_prefix`/`trim_suffix`, `Box::map`, `Vec::from_fn`, `mem::conjure_zst`, `UnsafeCell::replace`/`as_ref_unchecked`/`as_mut_unchecked` |
+| Partly | `str::trim_prefix` and `trim_suffix` take `&str` patterns only, like the other `str` methods here |
+| Waiting on `Drop` | `DropGuard` |
+| Waiting on `Rc`/`Arc` | `Rc::map`, `Arc::map` |
+| Waiting on `MaybeUninit` | `Box::take` |
+| Not modeled | custom allocators, `extern "custom"`, `Cow`, `Path`, `Once`, `Child`, target and Cargo changes, lints on attributes TSRust ignores |
+
 ## Roadmap: good next features
 
 Ordered roughly from easiest to hardest. Each line names where to start.
@@ -169,13 +192,11 @@ Ordered roughly from easiest to hardest. Each line names where to start.
 | ★★★ | `BigInt` for `i64`/`u64`/`i128`/`u128`, and exact 64-bit literals and constants for native code | the lexer, VM arithmetic, constants in the `.tsrb` format ([11-bytecode-format.md](11-bytecode-format.md)) |
 | ★★★ | Native code that keeps values in registers instead of on the stack | the templates in [src/native/compile.ts](../src/native/compile.ts) |
 | ★★★ | DWARF line tables, so `gdb` can show source | [src/native/elf.ts](../src/native/elf.ts) |
-| ★★★ | Arrays and slices (`[T; N]`, `&[T]`, `&v[a..b]`) | new `Ty` kinds, a `Ref`-based slice value, borrowck projections |
-| ★★★ | `let ... else`, unbounded ranges, `impl Trait` in argument position (sugar for generics) | parser desugaring plus typeck |
-| ★★★★ | Closures and `Fn`/`FnMut`/`FnOnce` | capture analysis, closure types in typeck, captured places in borrowck, a closure value in the VM. This unlocks `map`/`filter`. |
+| ★★★ | `let ... else` | parser desugaring plus typeck |
 | ★★★★ | `dyn Trait` with vtables | object-safety checks, a fat-pointer value, a `CALL_VIRTUAL` opcode |
 | ★★★★ | Checking function bodies against declared lifetimes | region variables and outlives constraints in [src/borrowck/](../src/borrowck/) |
 | ★★★★ | An AArch64 back end (and running the macOS and Windows outputs for real) | a new assembler next to [src/native/x64.ts](../src/native/x64.ts), the runtime rebuilt for `aarch64` |
 | ★★★★★ | `Drop` and panic unwinding, and with them freeing memory in native code | drop elaboration in MIR, cleanup paths in codegen, unwinding in the VM, a real allocator in [runtime.c](../native/runtime/runtime.c) |
 | ★★★★★ | `macro_rules!` | token-tree parsing and hygiene before the parser runs |
 
-Closures are the feature that would change TSRust the most. They touch every stage: parsing, inference of closure signatures, the borrow checker (captures are borrows), monomorphization (each closure has its own type), and the VM. Real Rust code relies on them heavily.
+`dyn Trait` is the feature that would change TSRust the most now: it brings the first real dynamic dispatch, and with it `Box<dyn Fn>`.

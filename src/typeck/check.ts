@@ -49,7 +49,8 @@ import type { Diagnostics, Span } from "../diagnostics.ts";
 import type * as A from "../parser/ast.ts";
 import type { Def, DefId, PartialRes } from "../resolve/defs.ts";
 import { InferCtxt } from "./infer.ts";
-import type { Adjustment, BindingMode, Callee, DerefStep, TypeckResults } from "./results.ts";
+import { isRestPat } from "./exhaustive.ts";
+import type { Adjustment, BindingMode, Callee, ClosureInfo, ClosureKind, DerefStep, TypeckResults } from "./results.ts";
 import { headKey, primTy, type Predicate, type TyCtxt } from "./tcx.ts";
 import { TraitSolver } from "./traits.ts";
 import {
@@ -73,6 +74,8 @@ type ValuePath =
   | { kind: "fn"; def: DefId; subst: Subst }
   | { kind: "ctor"; def: DefId; adtDef: DefId; adtArgs: Ty[] }
   | { kind: "const"; def: DefId; subst: Subst }
+  | { kind: "static"; def: DefId }
+  | { kind: "constParam"; def: DefId }
   | { kind: "err" };
 
 interface MethodPick {
@@ -87,6 +90,12 @@ export class FnCtxt {
   private readonly obligations: Obligation[] = [];
   private readonly loops = new Map<A.NodeId, LoopCtx>();
   private retTy: Ty = UNIT;
+  /** Greater than zero inside `unsafe` code. */
+  private unsafeDepth = 0;
+  /** Set while checking the operand of `&raw`, which may name a place without reading it. */
+  private rawOperand = false;
+  private readonly myClosures: ClosureInfo[] = [];
+  private readonly opaqueVars = new Map<number, Ty>();
   /** Inherent impls and trait methods are indexed once, lazily. */
   private static traitsByMethod?: Map<string, DefId[]>;
 
@@ -112,7 +121,8 @@ export class FnCtxt {
   checkFn(fn: A.FnItem) {
     const sig = this.tcx.fnSig(this.def);
     const params = sig.params.map((p) => this.normalize(p, fn.span));
-    this.retTy = this.normalize(sig.ret, fn.span);
+    this.retTy = this.defineOpaques(this.normalize(sig.ret, fn.span), fn.span);
+    if (fn.isUnsafe) this.unsafeDepth++; // an `unsafe fn` body is an unsafe context in editions before 2024
     let i = 0;
     if (fn.selfParam) {
       this.out.locals.set(fn.selfParam.id, { name: "self", ty: params[0], mutable: fn.selfParam.mutable, span: fn.selfParam.span });
@@ -133,6 +143,35 @@ export class FnCtxt {
     this.finish();
   }
 
+  /** Inside its own function, an `impl Trait` is an unknown type that must satisfy the bounds. */
+  private defineOpaques(t: Ty, span: Span): Ty {
+    const go = (t: Ty): Ty => {
+      if (t.k !== "opaque" || t.def !== this.def) return mapTy(t, go);
+      let v = this.opaqueVars.get(t.index);
+      if (!v) {
+        v = this.infcx.newVar();
+        this.opaqueVars.set(t.index, v);
+        const self = v;
+        const swap = (x: Ty): Ty => (x.k === "opaque" && x.index === t.index ? self : mapTy(x, swap));
+        for (const p of this.tcx.opaquePredicates(t)) {
+          if (p.kind === "trait") this.require(self, p.trait, p.args.map(swap), span);
+          else {
+            const n = this.normalize({ k: "proj", trait: p.trait, traitArgs: p.traitArgs.map(swap), self, name: p.name }, span);
+            this.infcx.unify(n, this.normalize(swap(p.ty), span));
+          }
+        }
+      }
+      return v;
+    };
+    return go(t);
+  }
+
+  private requireUnsafe(span: Span, what: string) {
+    if (this.unsafeDepth > 0) return;
+    this.diags.error("typeck", span, `${what} is unsafe and requires unsafe function or block`, "E0133")
+      .note("wrap this in an `unsafe { .. }` block once you have checked its safety requirements");
+  }
+
   checkConst(c: A.ConstItem, ty: Ty) {
     const actual = this.checkExpr(c.value, ty);
     this.coerce(c.value, actual, ty, c.value.span);
@@ -147,6 +186,11 @@ export class FnCtxt {
     this.checkDeferredNumeric();
     this.checkIntLiterals();
     this.writeback();
+    for (const [index, v] of this.opaqueVars) {
+      const hidden = this.infcx.resolve(v);
+      const o = this.tcx.opaques.get(index);
+      if (o) o.hidden = hidden;
+    }
   }
 
   /** Operators applied while an operand's type was still unknown; checked in `finish`. */
@@ -205,7 +249,19 @@ export class FnCtxt {
     for (const [id, t] of r.types) if (this.mine.has(id)) r.types.set(id, fix(t, this.spans.get(id)));
     for (const [id, c] of r.callees) if (this.mine.has(id)) r.callees.set(id, { def: c.def, substs: c.substs.map((t) => fix(t, this.spans.get(id))) });
     for (const [id, c] of r.ctors) if (this.mine.has(id)) r.ctors.set(id, { def: c.def, adtArgs: c.adtArgs.map((t) => fix(t)) });
-    for (const [id, l] of r.locals) if (this.mine.has(id)) l.ty = fix(l.ty, l.span);
+    for (const [id, l] of r.locals) {
+      if (!this.mine.has(id)) continue;
+      l.ty = fix(l.ty, l.span);
+      if (l.ty.k === "slice" || l.ty.k === "str") {
+        this.diags.error("typeck", l.span, `the size for values of type \`${this.show(l.ty)}\` cannot be known at compilation time`, "E0277")
+          .note("all local variables must have a statically known size");
+      }
+    }
+    for (const c of this.myClosures) {
+      c.params = c.params.map((t) => fix(t, c.node.span));
+      c.ret = fix(c.ret, c.node.span);
+    }
+    for (const [id, t] of r.constParams) if (this.mine.has(id)) r.constParams.set(id, fix(t));
     for (const [id, f] of r.forLoops) {
       if (!this.mine.has(id)) continue;
       r.forLoops.set(id, {
@@ -314,6 +370,7 @@ export class FnCtxt {
         } else {
           const sel = this.solver.select(o.self, o.trait, o.args);
           if (sel.kind === "ambiguous") continue;
+          this.noteClosureRequirement(o);
           if (sel.kind === "none") this.reportUnsatisfied(o);
           if (sel.kind === "impl" && sel.pending) {
             // Re-check the impl's where-clauses once more is known.
@@ -340,9 +397,25 @@ export class FnCtxt {
     }
   }
 
+  /** A closure's kind isn't known yet: remember which `Fn*` bound it must meet. */
+  private noteClosureRequirement(o: Extract<Obligation, { kind: "trait" }>) {
+    const self = this.infcx.shallow(o.self);
+    if (self.k !== "closure" || !this.tcx.isFnFamily(o.trait)) return;
+    this.out.closures.get(self.id)?.required.push({ kind: this.tcx.nameOf(o.trait) as ClosureKind, span: o.span });
+  }
+
   private reportUnsatisfied(o: Extract<Obligation, { kind: "trait" }>) {
     const self = this.infcx.resolve(o.self);
     if (containsKind(self, ["error"])) return;
+    if (self.k === "closure" && this.tcx.isFnFamily(o.trait)) {
+      if (this.diags.hasErrors) return; // the closure itself was already reported
+      const have = this.out.closures.get(self.id)?.params.length ?? 0;
+      const args = this.infcx.resolve(o.args[0]);
+      const want = args.k === "tuple" ? args.elems.length : have;
+      if (have !== want) this.diags.error("typeck", o.span, `closure is expected to take ${want} argument${want === 1 ? "" : "s"}, but it takes ${have} argument${have === 1 ? "" : "s"}`, "E0593");
+      else this.diags.error("typeck", o.span, "type mismatch in closure arguments", "E0631");
+      return;
+    }
     const name = this.tcx.nameOf(o.trait);
     const args = o.args.length ? `<${o.args.map((a) => this.show(a)).join(", ")}>` : "";
     const traitName = this.solver.traitName(o.trait);
@@ -370,7 +443,33 @@ export class FnCtxt {
   coerce(site: A.Expr | undefined, actual: Ty, expected: Ty, span: Span, note?: () => string | undefined): boolean {
     const a = this.infcx.shallow(actual);
     const e = this.infcx.shallow(expected);
-    if (a.k === "never") return true;
+    if (a.k === "never") {
+      this.infcx.markDiverging(e);
+      return true;
+    }
+    // `&T` → `*const T`, `&mut T` → `*mut T`, `*mut T` → `*const T`.
+    if (e.k === "ptr" && (a.k === "ref" || a.k === "ptr") && (a.mutable || !e.mutable)) {
+      const snap = this.infcx.snapshot();
+      if (this.infcx.unify(a.inner, e.inner)) return true;
+      this.infcx.rollback(snap);
+    }
+    // A function item or capture-free closure → `fn` pointer.
+    if (e.k === "fnptr" && (a.k === "fndef" || a.k === "closure")) {
+      const sig = this.tcx.callableSig(a);
+      if (sig && sig.params.length === e.params.length && (e.isUnsafe || !this.isUnsafeCallable(a))) {
+        const snap = this.infcx.snapshot();
+        const ok = sig.params.every((p, i) => this.infcx.unify(this.normalize(p, span), e.params[i])) && this.infcx.unify(this.normalize(sig.ret, span), e.ret);
+        if (ok) {
+          if (a.k === "closure") this.out.closures.get(a.id)!.toFnPtr = span;
+          if (site) {
+            this.out.coercions.set(site.id, ["fnptr"]);
+            this.mine.add(site.id);
+          }
+          return true;
+        }
+        this.infcx.rollback(snap);
+      }
+    }
     if (a.k === "ref" && e.k === "ref" && (a.mutable || !e.mutable)) {
       const snap = this.infcx.snapshot();
       if (this.infcx.unify(a.inner, e.inner)) return true;
@@ -399,12 +498,19 @@ export class FnCtxt {
     return false;
   }
 
+  private isUnsafeCallable(t: Ty): boolean {
+    if (t.k === "fnptr") return !!t.isUnsafe;
+    return t.k === "fndef" && this.defs[t.def].kind === "fn" && (this.defs[t.def].node as A.FnItem).isUnsafe;
+  }
+
   /** One built-in deref step, if the type supports it. */
   private derefOnce(t: Ty): { ty: Ty; step: DerefStep } | undefined {
     t = this.infcx.shallow(t);
     if (t.k === "ref") return { ty: t.inner, step: "ref" };
     if (t.k === "adt" && this.tcx.isLang(t.def, "Box")) return { ty: t.args[0], step: "box" };
     if (t.k === "adt" && this.tcx.isLang(t.def, "String")) return { ty: STR, step: "string" };
+    if (t.k === "adt" && this.tcx.isLang(t.def, "Vec")) return { ty: { k: "slice", elem: t.args[0] }, step: "vec" };
+    if (t.k === "array") return { ty: { k: "slice", elem: t.elem }, step: "unsize" };
     return undefined;
   }
 
@@ -446,10 +552,29 @@ export class FnCtxt {
       case "unary": return this.checkUnary(e, expected);
       case "ref": {
         const exp = expected ? this.infcx.shallow(expected) : undefined;
-        const innerExpected = exp?.k === "ref" ? exp.inner : undefined;
+        const innerExpected = exp?.k === "ref" || exp?.k === "ptr" ? exp.inner : undefined;
+        if (e.raw) this.rawOperand = true;
         const inner = this.checkExpr(e.expr, innerExpected);
-        return { k: "ref", mutable: e.mutable, inner };
+        this.rawOperand = false;
+        return e.raw ? { k: "ptr", mutable: e.mutable, inner } : { k: "ref", mutable: e.mutable, inner };
       }
+      case "array": {
+        const exp = expected ? this.infcx.shallow(expected) : undefined;
+        const elem = exp?.k === "array" || exp?.k === "slice" ? exp.elem : this.infcx.newVar();
+        for (const x of e.elems) this.checkExprCoerce(x, elem);
+        return { k: "array", elem, len: { k: "constval", n: e.elems.length } };
+      }
+      case "repeat": {
+        const exp = expected ? this.infcx.shallow(expected) : undefined;
+        const elem = exp?.k === "array" || exp?.k === "slice" ? exp.elem : this.infcx.newVar();
+        this.checkExprCoerce(e.value, elem);
+        this.checkExprCoerce(e.len, USIZE);
+        const len = this.tcx.constToTy(e.len, {});
+        const isConstValue = e.value.kind === "path" && this.out.callees.has(e.value.id);
+        if (!(len.k === "constval" && len.n <= 1) && !isConstValue) this.requireLang(elem, "Copy", e.value.span, "`[x; n]` copies `x`");
+        return { k: "array", elem, len };
+      }
+      case "closure": return this.checkClosure(e, expected);
       case "binary": return this.checkBinary(e);
       case "assign": return this.checkAssign(e);
       case "call": return this.checkCall(e, expected);
@@ -467,7 +592,13 @@ export class FnCtxt {
         });
         return { k: "tuple", elems };
       }
-      case "block": return this.checkBlock(e, expected);
+      case "block": {
+        if (!e.isUnsafe) return this.checkBlock(e, expected);
+        this.unsafeDepth++;
+        const t = this.checkBlock(e, expected);
+        this.unsafeDepth--;
+        return t;
+      }
       case "if": return this.checkIf(e, expected);
       case "while": {
         this.checkExprCoerce(e.cond, BOOL);
@@ -551,7 +682,11 @@ export class FnCtxt {
         if (s.init) {
           const initTy = this.checkExpr(s.init, normDeclared);
           if (normDeclared) { this.coerce(s.init, initTy, normDeclared, s.init.span); ty = normDeclared; }
-          else ty = initTy;
+          else if (this.infcx.shallow(initTy).k === "never") {
+            // `let x = return;`: `x` is a fresh variable, so `x = 5` still type checks.
+            ty = this.infcx.newVar();
+            this.infcx.markDiverging(ty);
+          } else ty = initTy;
           if (this.infcx.shallow(initTy).k === "never") diverges = true;
         } else {
           ty = normDeclared ?? this.infcx.newVar();
@@ -582,7 +717,7 @@ export class FnCtxt {
     this.checkExprCoerce(e.cond, BOOL);
     if (!e.else) {
       const t = this.checkExpr(e.then, UNIT);
-      if (!this.infcx.unify(t, UNIT)) {
+      if (this.infcx.shallow(t).k !== "never" && !this.infcx.unify(t, UNIT)) {
         this.diags.error("typeck", e.then.tail?.span ?? e.then.span, "`if` may be missing an `else` clause", "E0317")
           .note(`expected \`()\`, found \`${this.show(t)}\``)
           .note("`if` expressions without `else` evaluate to `()`");
@@ -594,11 +729,9 @@ export class FnCtxt {
     const elseTy = this.checkExpr(e.else, result);
     const t1 = this.infcx.shallow(thenTy), t2 = this.infcx.shallow(elseTy);
     if (t1.k === "never" && t2.k === "never") return NEVER;
-    if (t1.k !== "never") this.coerce(e.then.tail ?? e.then, thenTy, result, e.then.tail?.span ?? e.then.span);
-    if (t2.k !== "never") {
-      const site = e.else.kind === "block" ? e.else.tail ?? e.else : e.else;
-      this.coerce(site, elseTy, result, site.span, () => "`if` and `else` have incompatible types");
-    }
+    this.coerce(e.then.tail ?? e.then, thenTy, result, e.then.tail?.span ?? e.then.span);
+    const site = e.else.kind === "block" ? e.else.tail ?? e.else : e.else;
+    this.coerce(site, elseTy, result, site.span, () => "`if` and `else` have incompatible types");
     return result;
   }
 
@@ -610,10 +743,8 @@ export class FnCtxt {
       this.checkPat(arm.pat, scrut, "move");
       if (arm.guard) this.checkExprCoerce(arm.guard, BOOL);
       const t = this.checkExpr(arm.body, result);
-      if (this.infcx.shallow(t).k !== "never") {
-        allNever = false;
-        this.coerce(arm.body, t, result, arm.body.span, () => "`match` arms have incompatible types");
-      }
+      if (this.infcx.shallow(t).k !== "never") allNever = false;
+      this.coerce(arm.body, t, result, arm.body.span, () => "`match` arms have incompatible types");
     }
     if (e.arms.length === 0) return NEVER;
     return allNever ? NEVER : result;
@@ -646,8 +777,12 @@ export class FnCtxt {
 
   private checkRange(e: Extract<A.Expr, { kind: "range" }>): Ty {
     if (!e.start || !e.end) {
-      this.diags.error("typeck", e.span, "only bounded ranges (`a..b` and `a..=b`) are supported by TSRust");
-      return ERROR;
+      const bound = e.start ?? e.end;
+      const name = e.start ? "RangeFrom" : e.end ? (e.inclusive ? "RangeToInclusive" : "RangeTo") : "RangeFull";
+      const args = bound ? [this.checkExpr(bound)] : [];
+      const def = this.tcx.lang(name);
+      this.recordCtor(e.id, def, args);
+      return { k: "adt", def, args };
     }
     const start = this.checkExpr(e.start);
     const end = this.checkExpr(e.end, start);
@@ -664,14 +799,24 @@ export class FnCtxt {
     const t = this.infcx.shallow(target);
     const numeric = (x: Ty) => x.k === "int" || x.k === "float" || (x.k === "var" && this.infcx.kindOf(x.id) !== "general");
     let ok = false;
-    if (numeric(s) && numeric(t)) ok = true;
+    const pointee = (x: Ty) => this.infcx.shallow((x as { inner: Ty }).inner);
+    if (t.k === "ptr" && s.k === "ptr") ok = true;
+    else if (t.k === "ptr" && s.k === "ref" && (s.mutable || !t.mutable)) {
+      const from = pointee(s), to = pointee(t);
+      ok = from.k === "array" && to.k !== "array" && to.k !== "var" ? this.infcx.unify(from.elem, to) : this.infcx.unify(from, to);
+    }
+    else if (s.k === "ptr" && t.k === "int") ok = true;
+    else if (t.k === "ptr" && (s.k === "int" || (s.k === "var" && this.infcx.kindOf(s.id) === "int"))) { this.infcx.unify(s, USIZE); ok = true; }
+    else if (t.k === "fnptr" && (s.k === "fndef" || s.k === "closure")) ok = this.coerce(e.expr, s, t, e.span);
+    else if (numeric(s) && numeric(t)) ok = true;
     else if ((s.k === "bool" || s.k === "char") && t.k === "int") ok = true;
     else if (s.k === "int" && s.name === "u8" && t.k === "char") ok = true;
     else if (s.k === "var" && this.infcx.kindOf(s.id) === "int" && t.k === "char") { this.infcx.unify(s, { k: "int", name: "u8" }); ok = true; }
     else if (s.k === "adt" && t.k === "int" && this.defs[s.def].kind === "enum" && this.tcx.variants(s.def).every((v) => v.fieldsKind === "unit")) ok = true;
     else if (this.infcx.unify(s, t)) ok = true;
     if (!ok && s.k !== "error") {
-      this.diags.error("typeck", e.span, `non-primitive cast: \`${this.show(src)}\` as \`${this.show(target)}\``, "E0605")
+      if (t.k === "ptr" || s.k === "ptr") this.diags.error("typeck", e.span, `casting \`${this.show(src)}\` as \`${this.show(target)}\` is invalid`, "E0606");
+      else this.diags.error("typeck", e.span, `non-primitive cast: \`${this.show(src)}\` as \`${this.show(target)}\``, "E0605")
         .note("an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object");
     }
     // An unsuffixed literal being cast keeps its own default type (i32/f64).
@@ -747,6 +892,12 @@ export class FnCtxt {
       case "assert_eq": case "assert_ne": {
         const a = this.checkExpr(e.args[0]);
         const b = this.checkExpr(e.args[1], a);
+        if (this.isSeqComparison(a, b, e.span)) {
+          this.out.seqEq.add(e.id);
+          this.requireLang(a, "Debug", e.span);
+          this.requireLang(b, "Debug", e.span);
+          return UNIT;
+        }
         this.coerce(e.args[1], b, a, e.args[1].span);
         this.requireLang(a, "PartialEq", e.span);
         this.requireLang(a, "Debug", e.span);
@@ -827,7 +978,10 @@ export class FnCtxt {
       const d = this.defs[r.def];
       switch (d.kind) {
         case "fn": return { kind: "fn", def: d.id, subst: this.instantiate(d.id, last.generics, path.span) };
-        case "const": return { kind: "const", def: d.id, subst: new Map() };
+        case "tyParam": if (d.isConstParam) return { kind: "constParam", def: d.id }; break;
+        case "const": return (d.node as A.ConstItem).isStatic ? { kind: "static", def: d.id } : { kind: "const", def: d.id, subst: new Map() };
+      }
+      switch (d.kind) {
         case "struct": {
           const seg = path.segments[pr.baseIndex];
           return { kind: "ctor", def: d.id, adtDef: d.id, adtArgs: this.adtArgsFor(d.id, seg, path.span) };
@@ -947,20 +1101,35 @@ export class FnCtxt {
         this.recordCallee(e.id, vp.def, vp.subst, e.span);
         return this.normalize(substitute(this.tcx.constTy(vp.def), vp.subst), e.span);
       }
+      case "static": {
+        const node = this.defs[vp.def].node as A.ConstItem;
+        if (node.mutable && !this.rawOperand) this.requireUnsafe(e.span, "use of mutable static");
+        this.rawOperand = false;
+        this.out.statics.set(e.id, vp.def);
+        return this.tcx.constTy(vp.def);
+      }
+      case "constParam": {
+        const t = this.tcx.paramTy(vp.def);
+        this.out.constParams.set(e.id, t);
+        this.mine.add(e.id);
+        return USIZE;
+      }
       case "ctor": {
         const v = this.variantInfo(vp.def, vp.adtDef);
+        if (v?.fieldsKind === "tuple") {
+          // A tuple constructor used as a value is a function: `.map(Some)`.
+          return { k: "fndef", def: vp.def, substs: vp.adtArgs };
+        }
         if (v && v.fieldsKind !== "unit") {
-          this.diags.error("typeck", e.span, `\`${v.name}\` is a constructor with fields; call it like a function: \`${v.name}(..)\``, "E0533")
-            .note("TSRust doesn't support using constructors as function values");
+          this.diags.error("typeck", e.span, `expected value, found struct variant \`${v.name}\``, "E0533");
           return ERROR;
         }
         this.recordCtor(e.id, vp.def, vp.adtArgs);
         return { k: "adt", def: vp.adtDef, args: vp.adtArgs };
       }
       case "fn":
-        this.diags.error("typeck", e.span, `function \`${this.defs[vp.def].name}\` used as a value`)
-          .note("TSRust doesn't support function pointers or closures yet; call the function instead");
-        return ERROR;
+        this.registerPredicates(this.tcx.predicates(vp.def), vp.subst, e.span);
+        return { k: "fndef", def: vp.def, substs: this.tcx.allParams(vp.def).map((p) => vp.subst.get(p) ?? ERROR) };
       case "err": return ERROR;
     }
   }
@@ -973,28 +1142,134 @@ export class FnCtxt {
   // Calls
   // -------------------------------------------------------------------------
 
-  private checkArgs(args: A.Expr[], params: Ty[], span: Span, what: string) {
-    if (args.length !== params.length) {
+  private checkArgs(args: A.Expr[], params: Ty[], span: Span, what: string, countChecked = false) {
+    if (!countChecked && args.length !== params.length) {
       this.diags.error("typeck", span, `${what} takes ${params.length} argument${params.length === 1 ? "" : "s"} but ${args.length} ${args.length === 1 ? "argument was" : "arguments were"} supplied`, "E0061");
     }
-    args.forEach((a, i) => {
+    // Closures go last: by then the other arguments may have fixed the types
+    // their parameters need (`v.iter().fold(0, |sum, x| sum + x)`).
+    const pass = (closures: boolean) => args.forEach((a, i) => {
+      if ((a.kind === "closure") !== closures) return;
       if (i < params.length) this.checkExprCoerce(a, params[i]);
       else this.checkExpr(a);
     });
+    pass(false);
+    if (args.some((a) => a.kind === "closure")) {
+      this.processObligations(false);
+      pass(true);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Closures
+  // -------------------------------------------------------------------------
+
+  /** What the context says about a closure about to be checked. */
+  private closureHint(expected?: Ty): { params?: Ty[]; ret?: Ty; kind?: ClosureKind } {
+    const exp = expected ? this.infcx.shallow(expected) : undefined;
+    if (exp?.k === "fnptr") return { params: exp.params, ret: exp.ret };
+    if (exp?.k !== "var") return {};
+    const hint: { params?: Ty[]; ret?: Ty; kind?: ClosureKind } = {};
+    const same = (t: Ty) => { const s = this.infcx.shallow(t); return s.k === "var" && s.id === exp.id; };
+    for (const o of this.obligations) {
+      if (o.kind === "trait" && same(o.self) && this.tcx.isFnFamily(o.trait)) {
+        const args = this.infcx.shallow(o.args[0]);
+        if (args.k === "tuple") hint.params = args.elems;
+        hint.kind ??= this.tcx.nameOf(o.trait) as ClosureKind;
+      } else if (o.kind === "proj" && same(o.proj.self) && o.proj.name === "Output" && this.tcx.isFnFamily(o.proj.trait)) {
+        hint.ret = o.ty;
+        const args = this.infcx.shallow(o.proj.traitArgs[0]);
+        if (args.k === "tuple") hint.params ??= args.elems;
+      }
+    }
+    return hint;
+  }
+
+  private checkClosure(e: Extract<A.Expr, { kind: "closure" }>, expected?: Ty): Ty {
+    const hint = this.closureHint(expected);
+    const ctx = { selfTy: this.tcx.selfTyOf(this.def), fresh: this.fresh };
+    if (hint.params && hint.params.length !== e.params.length) {
+      this.diags.error("typeck", e.span, `closure is expected to take ${hint.params.length} argument${hint.params.length === 1 ? "" : "s"}, but it takes ${e.params.length} argument${e.params.length === 1 ? "" : "s"}`, "E0593");
+      hint.params = undefined;
+    }
+    const params = e.params.map((p, i) => {
+      const declared = p.ty ? this.normalize(this.tcx.astToTy(p.ty, ctx), p.ty.span) : undefined;
+      const wanted = hint.params?.[i];
+      if (declared && wanted && !this.infcx.unify(declared, wanted)) {
+        this.diags.error("typeck", p.ty!.span, `type mismatch in closure arguments: expected \`${this.show(wanted)}\`, found \`${this.show(declared)}\``, "E0631");
+      }
+      return declared ?? wanted ?? this.infcx.newVar();
+    });
+    const declaredRet = e.ret ? this.normalize(this.tcx.astToTy(e.ret, ctx), e.ret.span) : undefined;
+    if (declaredRet && hint.ret) this.infcx.unify(declaredRet, hint.ret);
+    const ret = declaredRet ?? hint.ret ?? this.infcx.newVar();
+    const info: ClosureInfo = { node: e, owner: this.def, params, ret, expectedKind: hint.kind, required: [] };
+    this.out.closures.set(e.id, info);
+    this.myClosures.push(info);
+    e.params.forEach((p, i) => this.checkPat(p.pat, params[i], "move"));
+
+    const savedRet = this.retTy;
+    this.retTy = ret;
+    const bodyTy = this.checkExpr(e.body, ret);
+    const site = e.body.kind === "block" && e.body.tail ? e.body.tail : e.body;
+    this.coerce(site, bodyTy, ret, site.span);
+    this.retTy = savedRet;
+    return { k: "closure", id: e.id, args: this.tcx.allParams(this.def).map((p) => this.tcx.paramTy(p)) };
+  }
+
+  /** `f(x)` where `f` is a value: a closure, fn pointer or anything implementing an `Fn` trait. */
+  private checkValueCall(e: Extract<A.Expr, { kind: "call" }>): Ty {
+    const calleeTy = this.checkExpr(e.callee);
+    this.processObligations(false);
+    const fail = (t: Ty) => {
+      e.args.forEach((a) => this.checkExpr(a));
+      if (this.infcx.shallow(t).k !== "error") this.diags.error("typeck", e.callee.span, `expected function, found \`${this.show(t)}\``, "E0618");
+      return ERROR;
+    };
+    for (const step of this.autoderef(calleeTy)) {
+      const u = this.infcx.shallow(step.ty);
+      if (u.k === "var" && this.infcx.kindOf(u.id) === "general") {
+        e.args.forEach((a) => this.checkExpr(a));
+        this.diags.error("typeck", e.callee.span, "type annotations needed", "E0282").note("the type of this value must be known to call it");
+        return ERROR;
+      }
+      const sig = this.tcx.callableSig(u);
+      if (sig) {
+        if (this.isUnsafeCallable(u)) this.requireUnsafe(e.span, "call to unsafe function");
+        this.setAdjust(e.callee.id, step.steps);
+        this.out.valueCalls.set(e.id, u.k === "closure" ? undefined : "Fn");
+        this.mine.add(e.id);
+        if (sig.params.length !== e.args.length) {
+          this.diags.error("typeck", e.span, `this function takes ${sig.params.length} argument${sig.params.length === 1 ? "" : "s"} but ${e.args.length} ${e.args.length === 1 ? "argument was" : "arguments were"} supplied`, u.k === "closure" || u.k === "fnptr" ? "E0057" : "E0061");
+        }
+        const params = sig.params.map((p) => this.normalize(p, e.span));
+        this.checkArgs(e.args, params, e.span, "this function", true);
+        return this.normalize(sig.ret, e.span);
+      }
+      const argVars = e.args.map(() => this.infcx.newVar());
+      const tuple: Ty = { k: "tuple", elems: argVars };
+      for (const name of ["Fn", "FnMut", "FnOnce"] as const) {
+        const trait = this.tcx.lang(name);
+        const snap = this.infcx.snapshot();
+        const sel = this.solver.select(u, trait, [tuple]);
+        if (sel.kind === "none" || sel.kind === "ambiguous") { this.infcx.rollback(snap); continue; }
+        this.setAdjust(e.callee.id, step.steps);
+        this.out.valueCalls.set(e.id, name);
+        this.mine.add(e.id);
+        this.checkArgs(e.args, argVars, e.span, "this function", true);
+        return this.normalize({ k: "proj", trait: this.tcx.lang("FnOnce"), traitArgs: [tuple], self: u, name: "Output" }, e.span);
+      }
+    }
+    return fail(calleeTy);
   }
 
   private checkCall(e: Extract<A.Expr, { kind: "call" }>, _expected?: Ty): Ty {
-    if (e.callee.kind !== "path") {
-      const t = this.checkExpr(e.callee);
-      e.args.forEach((a) => this.checkExpr(a));
-      if (this.infcx.shallow(t).k !== "error") {
-        this.diags.error("typeck", e.callee.span, `expected function, found \`${this.show(t)}\``, "E0618");
-      }
-      return ERROR;
-    }
+    if (e.callee.kind !== "path") return this.checkValueCall(e);
     const vp = this.resolveValuePath(e.callee.path, e.callee.id);
     switch (vp.kind) {
+      case "static": case "constParam": case "const": return this.checkValueCall(e);
       case "fn": {
+        if ((this.defs[vp.def].node as A.FnItem).isUnsafe) this.requireUnsafe(e.span, "call to unsafe function");
         const sig = this.tcx.fnSig(vp.def);
         const params = sig.params.map((p) => this.normalize(substitute(p, vp.subst), e.span));
         const ret = this.normalize(substitute(sig.ret, vp.subst), e.span);
@@ -1017,14 +1292,7 @@ export class FnCtxt {
         this.checkArgs(e.args, params, e.span, `this ${this.defs[vp.def].kind === "variant" ? "enum variant" : "struct"}`);
         return { k: "adt", def: vp.adtDef, args: vp.adtArgs };
       }
-      case "local": {
-        e.args.forEach((a) => this.checkExpr(a));
-        this.diags.error("typeck", e.callee.span, `expected function, found \`${this.show(vp.ty)}\``, "E0618");
-        return ERROR;
-      }
-      case "const":
-        this.diags.error("typeck", e.callee.span, `expected function, found constant`, "E0618");
-        return ERROR;
+      case "local": return this.checkValueCall(e);
       case "err":
         e.args.forEach((a) => this.checkExpr(a));
         return ERROR;
@@ -1041,6 +1309,7 @@ export class FnCtxt {
     }
     this.out.adjustments.set(e.receiver.id, pick.adjust);
     this.mine.add(e.receiver.id);
+    if ((this.defs[pick.def].node as A.FnItem).isUnsafe) this.requireUnsafe(e.span, "call to unsafe function");
     const sig = this.tcx.fnSig(pick.def);
     const params = sig.params.map((p) => this.normalize(substitute(p, pick.subst), e.span));
     const ret = this.normalize(substitute(sig.ret, pick.subst), e.span);
@@ -1229,10 +1498,28 @@ export class FnCtxt {
     this.processObligations(false);
     for (const step of this.autoderef(base)) {
       const u = this.infcx.shallow(step.ty);
-      if (u.k === "adt" && this.tcx.isLang(u.def, "Vec")) {
+      if (u.k === "slice" && e.index.kind === "range") {
+        // `&v[a..b]`, `&v[..]`: a view of part of a slice, array or Vec.
         this.setAdjust(e.expr.id, step.steps);
-        this.checkExprCoerce(e.index, USIZE);
-        return u.args[0];
+        const r = e.index;
+        if (r.start) this.checkExprCoerce(r.start, USIZE);
+        if (r.end) this.checkExprCoerce(r.end, USIZE);
+        this.record(r.id, UNIT);
+        this.out.sliceRanges.add(e.id);
+        return u;
+      }
+      if (e.index.kind !== "range" && (u.k === "array" || u.k === "slice" || (u.k === "adt" && this.tcx.isLang(u.def, "Vec")))) {
+        this.setAdjust(e.expr.id, step.steps);
+        const indexTy = this.checkExpr(e.index, USIZE);
+        if (this.infcx.shallow(indexTy).k !== "never" && !this.infcx.unify(indexTy, USIZE)) {
+          this.diags.error("typeck", e.index.span, `the type \`[${this.show(u.k === "adt" ? u.args[0] : u.elem)}]\` cannot be indexed by \`${this.show(indexTy)}\``, "E0277");
+          return ERROR;
+        }
+        if (u.k === "array" && u.len.k === "constval" && e.index.kind === "lit" && e.index.value.kind === "int" && e.index.value.value >= u.len.n) {
+          this.diags.error("typeck", e.span, "this operation will panic at runtime")
+            .note(`index out of bounds: the length is ${u.len.n} but the index is ${e.index.value.value}`);
+        }
+        return u.k === "adt" ? u.args[0] : u.elem;
       }
       if (u.k === "adt" && this.tcx.isLang(u.def, "HashMap")) {
         this.setAdjust(e.expr.id, step.steps);
@@ -1310,8 +1597,8 @@ export class FnCtxt {
       if (!field.isPub && !this.isDescendant(this.defs[this.def].module, this.defs[adtDef].module)) {
         this.diags.error("typeck", f.span, `field \`${f.name}\` of struct \`${v.name}\` is private`, "E0451");
       }
-      this.out.fieldIndices.set(f.value.id, i);
       this.checkExprCoerce(f.value, this.normalize(substitute(field.ty, subst), f.span));
+      this.out.litFields.set(f.value.id, i);
     }
     if (e.base) {
       this.checkExprCoerce(e.base, adtTy);
@@ -1338,9 +1625,15 @@ export class FnCtxt {
 
   private checkUnary(e: Extract<A.Expr, { kind: "unary" }>, expected?: Ty): Ty {
     if (e.op === "*") {
+      const raw = this.rawOperand;
+      this.rawOperand = false;
       const t = this.infcx.shallow(this.checkExpr(e.expr));
+      if (t.k === "ptr") {
+        if (!raw) this.requireUnsafe(e.span, "dereference of raw pointer");
+        return t.inner;
+      }
       if (t.k === "ref") return t.inner;
-      if (t.k === "adt" && this.tcx.isLang(t.def, "Box")) return t.args[0];
+      if (t.k === "adt" && (this.tcx.isLang(t.def, "Box") || this.tcx.isLang(t.def, "Vec") || this.tcx.isLang(t.def, "String"))) return this.derefOnce(t)!.ty;
       if (t.k !== "error") this.diags.error("typeck", e.span, `type \`${this.show(t)}\` cannot be dereferenced`, "E0614");
       return ERROR;
     }
@@ -1348,7 +1641,7 @@ export class FnCtxt {
     let t = this.infcx.shallow(this.checkExpr(e.expr, expected));
     t = this.derefNumeric(e.expr, t) ?? t;
     if (e.op === "!") {
-      if (t.k === "bool" || this.isNumeric(t) === "int") return t;
+      if (t.k === "bool" || t.k === "never" || this.isNumeric(t) === "int") return t;
     } else {
       const num = this.isNumeric(t);
       if (num === "float") return t;
@@ -1390,6 +1683,25 @@ export class FnCtxt {
     return this.normalize(substitute(sig.ret, subst), span);
   }
 
+  /** The element type if `t` is a Vec, array or slice, behind any references. */
+  private seqElem(t: Ty): Ty | undefined {
+    t = this.infcx.shallow(t);
+    while (t.k === "ref") t = this.infcx.shallow(t.inner);
+    if (t.k === "array" || t.k === "slice") return t.elem;
+    return t.k === "adt" && this.tcx.isLang(t.def, "Vec") ? t.args[0] : undefined;
+  }
+
+  /** `vec == [1, 2]`, `slice == vec`...: different sequence types compare element by element. */
+  private isSeqComparison(a: Ty, b: Ty, span: Span): boolean {
+    const x = this.seqElem(a), y = this.seqElem(b);
+    if (!x || !y) return false;
+    const head = (t: Ty) => { t = this.infcx.shallow(t); while (t.k === "ref") t = this.infcx.shallow(t.inner); return t.k; };
+    if (head(a) === head(b) && this.infcx.shallow(a).k === this.infcx.shallow(b).k) return false; // ordinary `==`
+    if (!this.infcx.unify(x, y)) return false;
+    this.requireLang(x, "PartialEq", span);
+    return true;
+  }
+
   private checkBinary(e: Extract<A.Expr, { kind: "binary" }>): Ty {
     const op = e.op;
     if (op === "&&" || op === "||") {
@@ -1400,8 +1712,12 @@ export class FnCtxt {
     const lhs = this.infcx.shallow(this.checkExpr(e.left));
     if (["==", "!=", "<", "<=", ">", ">="].includes(op)) {
       const rhs = this.checkExpr(e.right, lhs);
-      this.coerce(e.right, rhs, lhs, e.right.span);
       const isEq = op === "==" || op === "!=";
+      if (isEq && this.isSeqComparison(lhs, rhs, e.span)) {
+        this.out.seqEq.add(e.id);
+        return BOOL;
+      }
+      this.coerce(e.right, rhs, lhs, e.right.span);
       const traitName = isEq ? "PartialEq" : "PartialOrd";
       const trait = this.tcx.lang(traitName);
       const methodName = ({ "==": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge" } as Record<string, string>)[op];
@@ -1555,7 +1871,7 @@ export class FnCtxt {
    */
   checkPat(p: A.Pattern, expected: Ty, mode: BindingMode) {
     // Match ergonomics: a non-reference pattern against a reference peels it.
-    const peels = p.kind === "tuple" || p.kind === "tupleStruct" || p.kind === "struct" || p.kind === "path" || p.kind === "range" ||
+    const peels = p.kind === "tuple" || p.kind === "tupleStruct" || p.kind === "struct" || p.kind === "path" || p.kind === "range" || p.kind === "slice" ||
       (p.kind === "lit" && p.value.kind !== "str") || (p.kind === "ident" && this.tcx.res.patternPaths.has(p.id));
     let derefs = 0;
     if (peels) {
@@ -1578,6 +1894,40 @@ export class FnCtxt {
 
     switch (p.kind) {
       case "wild": return;
+      case "rest":
+        this.diags.error("typeck", p.span, "`..` patterns are only allowed inside slice patterns here");
+        return;
+      case "slice": {
+        let t = this.infcx.shallow(expected);
+        const at = p.elems.findIndex(isRestPat);
+        const fixed = at < 0 ? p.elems.length : p.elems.length - 1;
+        if (t.k === "var" && this.infcx.kindOf(t.id) === "general") {
+          const arr: Ty = { k: "array", elem: this.infcx.newVar(), len: at < 0 ? { k: "constval", n: fixed } : this.infcx.newVar() };
+          this.infcx.unify(t, arr);
+          t = arr;
+        }
+        if (t.k !== "array" && t.k !== "slice") {
+          if (t.k !== "error") this.diags.error("typeck", p.span, `expected an array or slice, found \`${this.show(t)}\``, "E0529");
+          return;
+        }
+        let restTy: Ty = { k: "slice", elem: t.elem };
+        if (t.k === "array") {
+          const len = this.infcx.shallow(t.len);
+          if (len.k === "constval") {
+            if (at < 0 ? len.n !== fixed : len.n < fixed) {
+              this.diags.error("typeck", p.span, `pattern requires ${at < 0 ? "" : "at least "}${fixed} element${fixed === 1 ? "" : "s"} but array has ${len.n}`, at < 0 ? "E0527" : "E0528");
+              return;
+            }
+            restTy = { k: "array", elem: t.elem, len: { k: "constval", n: len.n - fixed } };
+          }
+        }
+        const elem = t.elem;
+        p.elems.forEach((x, i) => {
+          if (i === at) { if (x.kind === "ident") this.checkPat(x, restTy, mode); else this.record(x.id, restTy); }
+          else this.checkPat(x, elem, mode);
+        });
+        return;
+      }
       case "ident": {
         const asPath = this.tcx.res.patternPaths.get(p.id);
         if (asPath) { this.checkPathPat(p, asPath, expected); return; }
@@ -1592,7 +1942,7 @@ export class FnCtxt {
         this.out.bindingModes.set(p.id, bindingMode);
         this.out.locals.set(p.id, { name: p.name, ty, mutable: p.mutable && !p.byRef, span: p.span });
         this.mine.add(p.id);
-        if (p.sub) this.checkPat(p.sub, expected, mode);
+        if (p.sub && p.sub.kind !== "rest") this.checkPat(p.sub, expected, mode);
         return;
       }
       case "lit": {
